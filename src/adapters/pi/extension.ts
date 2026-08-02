@@ -23,6 +23,7 @@ import type { HookInput } from "../../session/extract.js";
 import { buildResumeSnapshot } from "../../session/snapshot.js";
 import type { SessionEvent } from "../../types.js";
 import { bootstrapMCPTools, makeBridgeDiag, isForegroundSession, QUESTION_IS_ERROR_DETAILS_KEY, type BridgeHandle } from "./mcp-bridge.js";
+import { captureFrozenContext, clearFrozenContextCheckpoint } from "./frozen-context.js";
 import { PiAdapter } from "./index.js";
 
 // ── Pi Tool Name Mapping ─────────────────────────────────
@@ -466,6 +467,9 @@ export default function piExtension(pi: any): void {
 
   pi.on("session_start", (_event: any, ctx: any) => {
     try {
+      // A new/resumed/forked session must never replay the previous
+      // session's frozen prefix into its question calls.
+      clearFrozenContextCheckpoint();
       _sessionId = deriveSessionId(ctx ?? {});
       db.ensureSession(_sessionId, projectDir);
       db.cleanupOldSessions(7);
@@ -475,6 +479,19 @@ export default function piExtension(pi: any): void {
         _sessionId = `pi-${Date.now()}`;
       }
     }
+  });
+
+  // ── 1b. before_provider_request — frozen-context checkpoint ────
+  // Rotating capture of the exact wire payload Pi sends. This is what
+  // makes `question`-mode prompt-cache reuse possible: the nested call
+  // replays these bytes + one appended question block, so the provider
+  // bills the whole prefix as a cache READ (~0.1×). Capture is
+  // shape-guarded and never mutates or replaces the payload.
+  // Spec + proof: dev-docs/cache-experiment/MANUAL.md.
+
+  pi.on("before_provider_request", (event: any) => {
+    captureFrozenContext(event?.payload);
+    // No return value — we observe, never rewrite.
   });
 
   // ── 2. tool_call — PreToolUse routing enforcement ──────

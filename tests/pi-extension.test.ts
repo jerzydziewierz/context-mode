@@ -507,6 +507,34 @@ describe("Pi Extension", () => {
       });
     });
 
+    it("before_provider_request captures the frozen-context checkpoint; session_start clears it", async () => {
+      const { getFrozenContextCheckpoint, clearFrozenContextCheckpoint } =
+        await import("../src/adapters/pi/frozen-context.js");
+      clearFrozenContextCheckpoint();
+      await registerPiExtension(api);
+      expect(api._handlers["before_provider_request"]).toBeDefined();
+
+      const payload = {
+        model: "claude-sonnet-5",
+        messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+      };
+      // Handler must observe without rewriting: a return value would
+      // replace the payload Pi sends (runner contract).
+      const result = await api._trigger("before_provider_request", {
+        type: "before_provider_request",
+        payload,
+      });
+      expect(result).toBeUndefined();
+      expect(getFrozenContextCheckpoint()?.payload).toBe(payload);
+
+      // New session ⇒ stale prefix must be dropped.
+      await api._trigger("session_start", {
+        session_id: "test-session-clear",
+        project_dir: tempDir,
+      });
+      expect(getFrozenContextCheckpoint()).toBeNull();
+    });
+
     it("session_start uses Pi context arg for stable session ID", async () => {
       await registerPiExtension(api);
       const sessionFile = join(tempDir, "stable-session.jsonl");

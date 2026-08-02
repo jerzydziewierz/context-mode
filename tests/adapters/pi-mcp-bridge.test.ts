@@ -222,6 +222,230 @@ describe("Pi question-answer side channel", () => {
   });
 });
 
+// Frozen-context prompt-cache reuse (dev-docs/cache-experiment/MANUAL.md).
+// The question call must ride the PRIMARY loop's exact wire payload —
+// full context + appended question block — and read the prompt cache,
+// not re-send a question-only prompt at full price.
+describe("Pi question mode — frozen-context replay", () => {
+  const questionResult = (isError = false) => ({
+    content: [{ type: "text", text: "fallback envelope" }],
+    isError,
+    _meta: {
+      "context-mode/question": {
+        version: 1,
+        question: "Did tests pass?",
+        answerInput: "Tests: 12 passed, 2 failed\nValidationError: missing apiKey",
+        evidence: "ValidationError: missing apiKey",
+        rawOutputBytes: 58,
+        outputReduced: false,
+        source: "execute:shell:question:test-id",
+        status: isError ? "failed (exit 1)" : "completed (exit 0)",
+        exitCode: isError ? 1 : 0,
+        timedOut: false,
+        backgrounded: false,
+        isError,
+      },
+    },
+  });
+
+  // The exact-wire-payload shape Pi emits at before_provider_request:
+  // system + tools + messages with cache_control breakpoints already
+  // placed by the anthropic-messages adapter (system / last tool / last
+  // user — 3 of Anthropic's 4 allowed).
+  const primaryPayload = () => ({
+    model: "claude-sonnet-5",
+    stream: true,
+    max_tokens: 8192,
+    system: [{ type: "text", text: "You are Pi.", cache_control: { type: "ephemeral" } }],
+    tools: [{ name: "ctx_execute", input_schema: {}, cache_control: { type: "ephemeral" } }],
+    messages: [
+      { role: "user", content: [{ type: "text", text: "run the tests", cache_control: { type: "ephemeral" } }] },
+      { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "ctx_execute", input: {} }] },
+    ],
+  });
+
+  const anthropicResponse = (overrides: Record<string, unknown> = {}) => ({
+    ok: true,
+    status: 200,
+    json: async () => ({
+      content: [{ type: "text", text: '{"answer":"No. Two tests failed.","evidence":"ValidationError: missing apiKey"}' }],
+      stop_reason: "end_turn",
+      usage: { input_tokens: 12, output_tokens: 40, cache_read_input_tokens: 15_150, cache_creation_input_tokens: 0 },
+      ...overrides,
+    }),
+  });
+
+  afterEach(async () => {
+    const { clearFrozenContextCheckpoint } = await import("../../src/adapters/pi/frozen-context.js");
+    clearFrozenContextCheckpoint();
+  });
+
+  it("captures only well-formed payloads and rotates to the latest", async () => {
+    const { captureFrozenContext, getFrozenContextCheckpoint, clearFrozenContextCheckpoint } =
+      await import("../../src/adapters/pi/frozen-context.js");
+    clearFrozenContextCheckpoint();
+
+    captureFrozenContext(undefined);
+    captureFrozenContext("not an object");
+    captureFrozenContext({ model: "m" }); // no messages
+    captureFrozenContext({ messages: [{}] }); // no model
+    expect(getFrozenContextCheckpoint()).toBeNull();
+
+    const first = primaryPayload();
+    captureFrozenContext(first);
+    expect(getFrozenContextCheckpoint()?.payload).toBe(first);
+
+    const second = { ...primaryPayload(), model: "claude-opus-5" };
+    captureFrozenContext(second);
+    expect(getFrozenContextCheckpoint()?.payload).toBe(second);
+    expect(getFrozenContextCheckpoint()?.wireModelId).toBe("claude-opus-5");
+
+    clearFrozenContextCheckpoint();
+    expect(getFrozenContextCheckpoint()).toBeNull();
+  });
+
+  it("replays the FULL captured context plus one appended question block — not a question-only prompt", async () => {
+    const { captureFrozenContext } = await import("../../src/adapters/pi/frozen-context.js");
+    const { answerQuestionResult } = await import("../../src/adapters/pi/mcp-bridge.js");
+    const payload = primaryPayload();
+    captureFrozenContext(payload);
+
+    const fetchSpy = vi.fn(async () => anthropicResponse());
+    vi.stubGlobal("fetch", fetchSpy);
+    try {
+      const primary = { provider: "dario", id: "claude-sonnet-5", baseUrl: "http://localhost:3456", contextWindow: 200_000 };
+      const streamSimple = vi.fn(); // shortlist path must NOT run
+      const answered = await answerQuestionResult(questionResult(true), {
+        model: primary,
+        modelRegistry: {
+          getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "dario" }),
+          getProvider: () => ({ streamSimple }),
+        },
+      }, ["p/small"]);
+
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(streamSimple).not.toHaveBeenCalled();
+      const [url, init] = fetchSpy.mock.calls[0] as unknown as [string, { body: string; headers: Record<string, string> }];
+      expect(url).toBe("http://localhost:3456/v1/messages");
+      expect(init.headers["x-api-key"]).toBe("dario");
+      const body = JSON.parse(init.body);
+      // Prefix bytes: identical system/tools/leading-messages, stream dropped.
+      expect(body.stream).toBeUndefined();
+      expect(body.system).toEqual(payload.system);
+      expect(body.tools).toEqual(payload.tools);
+      expect(body.messages.slice(0, payload.messages.length)).toEqual(payload.messages);
+      // Appended tail: exactly one user block carrying the question + output,
+      // with its own ephemeral breakpoint (4th of 4).
+      expect(body.messages).toHaveLength(payload.messages.length + 1);
+      const tail = body.messages[body.messages.length - 1];
+      expect(tail.role).toBe("user");
+      expect(tail.content[0].cache_control).toEqual({ type: "ephemeral" });
+      expect(tail.content[0].text).toContain("Did tests pass?");
+      expect(tail.content[0].text).toContain("Tests: 12 passed, 2 failed");
+      // The captured payload object itself must never be mutated.
+      expect(payload.messages).toHaveLength(2);
+      expect(payload.stream).toBe(true);
+
+      // Answer + cache proof surface to the caller.
+      expect(answered?.text).toContain("Answer: No. Two tests failed.");
+      expect(answered?.usage).toMatchObject({ cacheRead: 15_150, cacheWrite: 0 });
+      expect(answered?.originalIsError).toBe(true);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("omits the tail breakpoint when the captured payload already holds 4", async () => {
+    const { captureFrozenContext, askWithFrozenContext, getFrozenContextCheckpoint } =
+      await import("../../src/adapters/pi/frozen-context.js");
+    const payload = primaryPayload();
+    // 4th breakpoint on the assistant message (contrived but legal).
+    (payload.messages[1].content[0] as Record<string, unknown>).cache_control = { type: "ephemeral" };
+    captureFrozenContext(payload);
+
+    const fetchSpy = vi.fn(async () => anthropicResponse());
+    await askWithFrozenContext({
+      checkpoint: getFrozenContextCheckpoint()!,
+      questionBlockText: "q",
+      baseUrl: "http://localhost:3456",
+      apiKey: "k",
+      fetchImpl: fetchSpy as unknown as typeof fetch,
+    });
+    const body = JSON.parse((fetchSpy.mock.calls[0] as unknown as [string, { body: string }])[1].body);
+    const tail = body.messages[body.messages.length - 1];
+    expect(tail.content[0].cache_control).toBeUndefined();
+  });
+
+  it("skips replay when the checkpoint model differs from the current primary model", async () => {
+    const { captureFrozenContext } = await import("../../src/adapters/pi/frozen-context.js");
+    const { answerQuestionResult } = await import("../../src/adapters/pi/mcp-bridge.js");
+    captureFrozenContext(primaryPayload()); // claude-sonnet-5
+
+    const fetchSpy = vi.fn();
+    vi.stubGlobal("fetch", fetchSpy);
+    try {
+      const switched = { provider: "dario", id: "claude-opus-5", baseUrl: "http://localhost:3456", contextWindow: 200_000 };
+      const streamSimple = vi.fn(() => ({
+        result: async () => ({
+          content: [{ type: "text", text: '{"answer":"ok","evidence":"ValidationError: missing apiKey"}' }],
+          stopReason: "stop",
+          usage: { input: 20, output: 10, cacheRead: 0, cacheWrite: 0, totalTokens: 30 },
+        }),
+      }));
+      const answered = await answerQuestionResult(questionResult(), {
+        model: switched,
+        scopedModels: [{ model: switched }],
+        modelRegistry: {
+          getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "secret" }),
+          getProvider: () => ({ streamSimple }),
+        },
+      }, []);
+      // Stale-prefix replay would be a guaranteed cache miss AND cross-model
+      // context bleed — must fall through to the shortlist path instead.
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(streamSimple).toHaveBeenCalledTimes(1);
+      expect(answered?.text).toContain("Answer: ok");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("falls back to the shortlist path when the replay transport fails", async () => {
+    const { captureFrozenContext } = await import("../../src/adapters/pi/frozen-context.js");
+    const { answerQuestionResult } = await import("../../src/adapters/pi/mcp-bridge.js");
+    captureFrozenContext(primaryPayload());
+
+    const fetchSpy = vi.fn(async () => ({ ok: false, status: 502, json: async () => ({ error: { message: "proxy down" } }) }));
+    vi.stubGlobal("fetch", fetchSpy);
+    try {
+      const primary = { provider: "dario", id: "claude-sonnet-5", baseUrl: "http://localhost:3456", contextWindow: 200_000 };
+      const cheap = { provider: "p", id: "small", contextWindow: 32_000 };
+      const streamSimple = vi.fn(() => ({
+        result: async () => ({
+          content: [{ type: "text", text: '{"answer":"fallback works","evidence":"ValidationError: missing apiKey"}' }],
+          stopReason: "stop",
+          usage: { input: 20, output: 10, cacheRead: 0, cacheWrite: 0, totalTokens: 30 },
+        }),
+      }));
+      const answered = await answerQuestionResult(questionResult(), {
+        model: primary,
+        scopedModels: [{ model: primary }, { model: cheap }],
+        modelRegistry: {
+          getAvailable: () => [primary, cheap],
+          getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "k" }),
+          getProvider: () => ({ streamSimple }),
+        },
+      }, ["p/small"]);
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(streamSimple).toHaveBeenCalledTimes(1);
+      expect(streamSimple.mock.calls[0]?.[0]).toBe(cheap);
+      expect(answered?.text).toContain("Answer: fallback works");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
 // Slice 2 — env depth counter
 describe("MCP bridge spawn — passes CONTEXT_MODE_BRIDGE_DEPTH=1 to child env (#516)", () => {
   it("child process inherits CONTEXT_MODE_BRIDGE_DEPTH=1", async () => {

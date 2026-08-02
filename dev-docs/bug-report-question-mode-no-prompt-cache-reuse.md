@@ -1,6 +1,16 @@
 # Bug report: `question` mode nested model call cannot reuse the primary prompt cache
 
-Status: **FIXED (s3-cmq)** — option 1 applied at `src/adapters/pi/mcp-bridge.ts` (`cacheRetention: "none"`
+Status: **FIXED (s5-cmq) — cache reuse now implemented.** The frozen-context replay path
+(`src/adapters/pi/frozen-context.ts` + the `before_provider_request` capture in `extension.ts`)
+sends the FULL captured primary wire payload + one appended question block to the primary
+model's own endpoint, so the whole prefix bills as a cache READ (mechanism proven 2026-08-02,
+cacheRead≈15.1k / cacheWrite=0, 5/5 — see `dev-docs/cache-experiment/MANUAL.md`). The
+question also now *sees the full session context* (Grey's original ask). The s3 fix below
+(`cacheRetention: "none"` + fresh uuid on the standalone shortlist call) remains correct **as
+the fallback path** — it runs when no checkpoint exists (fresh session, non-capturing host,
+model switch) or when the replay transport fails.
+
+Prior status: **FIXED (s3-cmq)** — option 1 applied at `src/adapters/pi/mcp-bridge.ts` (`cacheRetention: "none"`
 + fresh `randomUUID()`), with a comment naming pi's own convention so it does not get "re-optimized"
 back.
 

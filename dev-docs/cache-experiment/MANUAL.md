@@ -104,10 +104,28 @@ wins on every axis → **Q-s2-1 resolved: warm cache.**
 `cmq-exp-extension.ts` in this dir — `before_provider_request` dump + turn_end
 raw replay (C2): the exact working pattern, ~40 lines of relevant code.
 
-## Next (per Grey): apply to context-mode `question` parameter
+## Applied (s5-cmq): context-mode `question` parameter — DONE
 
-The `question` param (mcp-bridge.ts nested call, currently `cacheRetention:
-"none"` + separate/short context at ~:359-381) should instead: capture the
-primary payload at the boundary, and send **full frozen context + question** via
-the C2 raw-replay pattern (or C1 pi-ai path with the auth fix), `cacheRetention:
-"short"` — so the question sees the full context AND reads the primary cache.
+Implemented exactly as specified, via the C2 raw-replay pattern:
+
+- `src/adapters/pi/frozen-context.ts` — `captureFrozenContext()` (rotating
+  in-memory checkpoint of the last primary wire payload, shape-guarded) +
+  `askWithFrozenContext()` (clone → drop `stream` → append question block →
+  POST `{baseUrl}/v1/messages` with the provider key). Breakpoint budget is
+  honored: the appended block only carries `cache_control` when the captured
+  payload holds < 4.
+- `src/adapters/pi/extension.ts` — registers `before_provider_request` →
+  capture; `session_start` clears the checkpoint (no stale-prefix bleed).
+- `src/adapters/pi/mcp-bridge.ts` — `answerQuestionResult()` prefers the
+  replay path when a checkpoint exists AND its wire model id matches the
+  current primary model; falls back to the s3 shortlist path (standalone
+  small prompt, `cacheRetention: "none"`) on any replay failure, model
+  switch, or missing checkpoint. A miss is a cost issue, never correctness.
+- Tests: `tests/adapters/pi-mcp-bridge.test.ts` ("frozen-context replay"
+  describe — full-context-not-question-only wire assertion, breakpoint
+  budget, model-mismatch guard, transport-failure fallback) and
+  `tests/pi-extension.test.ts` (capture + session_start clearing).
+
+C1 (reconstruction via buildSessionContext/convertToLlm) was **dropped**: the
+hook hands over the exact payload, so reconstruction is strictly worse
+(byte-drift risk; also its auth failure in the experiment was never resolved).

@@ -28,6 +28,7 @@ import { join } from "node:path";
 import { spawn, execSync, type ChildProcess } from "node:child_process";
 import { detectRuntimes } from "../../runtime.js";
 import { foreignWorkspaceEnv, foreignIdentificationEnv } from "../detect.js";
+import { askWithFrozenContext, getFrozenContextCheckpoint } from "./frozen-context.js";
 
 interface PendingRequest {
   resolve: (value: unknown) => void;
@@ -292,6 +293,31 @@ function buildQuestionInput(meta: QuestionMeta, model: any): string {
   });
 }
 
+/**
+ * Appended user block for the frozen-context replay path. Unlike
+ * buildQuestionInput (a standalone prompt for a context-blind model),
+ * this block RIDES ON the full frozen session context, so the
+ * instructions scope the model to interpreting the new output only —
+ * Grey's intent: the session explains WHY the command ran; the model
+ * summarizes/interprets the output in that light, and only the compact
+ * conclusion returns to the primary agent.
+ */
+function buildFrozenQuestionInput(meta: QuestionMeta, model: any): string {
+  return [
+    "[context-mode question side-channel — not part of the conversation]",
+    "The conversation above is the live session context, frozen at the moment",
+    "a tool call executed. Below is that tool call's raw result, which the",
+    "primary agent has NOT seen. Using the session context to understand why",
+    "the command was run, interpret and summarize ONLY this execution result.",
+    "Do not continue the conversation. Do not call tools.",
+    "Return a single JSON object with string fields \"answer\" and \"evidence\".",
+    "Keep the answer compact. Copy a short exact evidence excerpt from the",
+    "execution result. Use the authoritative status exactly as supplied.",
+    "",
+    buildQuestionInput(meta, model),
+  ].join("\n");
+}
+
 function responseText(response: any): string {
   if (!Array.isArray(response?.content)) return "";
   return response.content
@@ -335,6 +361,73 @@ export async function answerQuestionResult(
       text: (result.content ?? []).map((c) => c.text ?? "").join("\n"),
       originalIsError: meta.isError,
     };
+  }
+
+  // ── Frozen-context path (preferred) ────────────────────────────────
+  //
+  // When the extension has captured the primary loop's wire payload
+  // (before_provider_request → captureFrozenContext), replay it with the
+  // question appended. The question model MUST be the primary model:
+  // Anthropic's prompt cache is keyed per model+endpoint+account, so only
+  // the model that sent the prefix can read it (~0.1× billed as
+  // cacheRead). The budget shortlist below stays as the fallback for
+  // fresh sessions, non-capturing hosts, and replay failures — a cache
+  // MISS on this path is a cost issue, never a correctness issue.
+  const checkpoint = getFrozenContextCheckpoint();
+  const primaryModel = ctx.model;
+  if (
+    checkpoint
+    && primaryModel
+    && typeof (primaryModel as any).baseUrl === "string"
+    && checkpoint.wireModelId === String((primaryModel as any).id ?? "")
+  ) {
+    try {
+      const auth = await ctx.modelRegistry.getApiKeyAndHeaders(primaryModel);
+      if (auth.ok && auth.apiKey) {
+        const replay = await askWithFrozenContext({
+          checkpoint,
+          questionBlockText: buildFrozenQuestionInput(meta, primaryModel),
+          baseUrl: (primaryModel as any).baseUrl,
+          apiKey: auth.apiKey,
+          headers: auth.headers,
+          maxTokens: 1_200,
+          signal: ctx.signal,
+        });
+        if (replay.stopReason === "error") throw new Error("Frozen-context replay returned error stop");
+        const answered = parseQuestionAnswer(replay.text, meta);
+        if (answered) {
+          return {
+            text: [
+              `Status: ${meta.status}`,
+              `Answer: ${answered.answer}`,
+              `Evidence: ${answered.evidence}`,
+              `Full output: ${meta.source}`,
+              `Retrieve: ctx_search(queries: [${JSON.stringify(meta.question)}], source: ${JSON.stringify(meta.source)})`,
+            ].join("\n"),
+            usage: replay.usage,
+            originalIsError: meta.isError,
+          };
+        }
+        // Parse failure with a healthy transport: don't burn a second
+        // full-price shortlist call — return the evidence envelope with
+        // the replay usage attached.
+        return {
+          text: [
+            `Status: ${meta.status}`,
+            "Answer: Semantic answer unavailable: the answer model returned invalid structured data.",
+            `Evidence: ${compactEvidence(meta.answerInput, meta.evidence)}`,
+            `Full output: ${meta.source}`,
+            `Retrieve: ctx_search(queries: [${JSON.stringify(meta.question)}], source: ${JSON.stringify(meta.source)})`,
+          ].join("\n"),
+          usage: replay.usage,
+          originalIsError: meta.isError,
+        };
+      }
+    } catch {
+      // Replay path failed (endpoint drift, auth, aborted, proxy down).
+      // Fall through to the shortlist path — same behavior as before
+      // this feature existed.
+    }
   }
 
   try {
