@@ -100,7 +100,17 @@ About to run a command / read a file / call an API?
 | Playwright console/network | `browser_*(filename)` → `ctx_execute_file(path)` | Save to file, analyze in sandbox |
 | MCP output (already in context) | Use directly | Don't re-index — it's already loaded |
 | MCP output (need multi-query) | `ctx_execute` to save → `ctx_index(path)` → `ctx_search` | Save to file first, index server-side |
+| Focused semantic answer under Pi | `ctx_execute(..., question: "...")` or `ctx_execute_file(..., question: "...")` | Stores the full raw output and returns status, a compact answer, evidence, and a retrieval reference |
 | Wipe indexed KB content | `ctx_purge(confirm: true)` | Permanently deletes all indexed content |
+
+## The `question` Parameter
+
+Both `ctx_execute` and `ctx_execute_file` accept an optional `question` string. Use it when you need a focused answer about the execution result while keeping the raw output out of the primary Pi agent context.
+
+- Ask one concrete, answerable question about the result, such as `question: "Which tests failed and what caused each failure?"`.
+- Context Mode stores the full raw output, then the Pi adapter returns a compact response containing status, answer, evidence, and a reference for retrieving the full output.
+- Semantic answering requires the Pi adapter. Other MCP hosts return the status, evidence preview, and retrieval reference without a generated semantic answer.
+- Use `intent` when you want topic-based indexing/search; use `question` when you want a direct model-generated answer.
 
 ## Automatic Triggers
 

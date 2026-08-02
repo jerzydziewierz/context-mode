@@ -1,6 +1,11 @@
 # Bug report: `question` mode nested model call cannot reuse the primary prompt cache
 
-Status: **design defect, confirmed by reading pi source**. Not a crash. It costs money on every `question:` call.
+Status: **FIXED (s3-cmq)** — option 1 applied at `src/adapters/pi/mcp-bridge.ts` (`cacheRetention: "none"`
++ fresh `randomUUID()`), with a comment naming pi's own convention so it does not get "re-optimized"
+back. The Fireworks open question below is now answered: yes, both shortlist models honor
+`cacheRetention`, and the fix is correct on both API paths.
+
+Original status: **design defect, confirmed by reading pi source**. Not a crash. It cost money on every `question:` call.
 
 ## Where
 
@@ -62,9 +67,32 @@ Root: `/home/mib07150/.local/share/pi-node/node-v22.23.1-linux-x64/lib/node_modu
 Recommendation: option 1 now, and note option 2 in the code as a comment so a future agent does not
 "re-optimize" it back to `"short"`.
 
-## Not yet verified
+## Resolved: do the Fireworks shortlist models honor `cacheRetention`? — YES, both, on both paths
 
-- Whether the Fireworks models named in `~/.pi/model-shortlist.env`
-  (`accounts/fireworks/models/kimi-k3`, `accounts/fireworks/models/glm-5p2`) honor `cacheRetention` at
-  all. They go through the OpenAI-completions API path, not `anthropic-messages.js`. Worth one grep of
-  `pi-ai/dist/api/openai-completions.js` before finalizing option 1's wording.
+Checked `pi-ai/dist/providers/data/fireworks.json`. The two shortlist models do **not** share an API path:
+
+| shortlist model | api | relevant compat |
+|---|---|---|
+| `accounts/fireworks/models/kimi-k3` | `anthropic-messages` | `sendSessionAffinityHeaders: true`, `supportsCacheControlOnTools: false`, `supportsLongCacheRetention: false` |
+| `accounts/fireworks/models/glm-5p2` | `openai-completions` | `supportsStore: false`, `supportsDeveloperRole: false` |
+
+So `kimi-k3` — the **first** shortlist entry, i.e. the default question model — goes through
+`anthropic-messages.js` after all, and every cache finding in this report applies to it directly.
+
+`glm-5p2` goes through `openai-completions.js`, which honors `cacheRetention` through its own
+`resolveCacheRetention()` (`:93-99`, same default-to-`"short"` shape as the Anthropic path). Two
+consequences there:
+
+- `getCompatCacheControl()` (`:690-696`) returns `undefined` unless `cacheControlFormat === "anthropic"`,
+  which for Fireworks it is not (`:1157` sets it only for OpenRouter + `anthropic/` model ids). So no
+  explicit `cache_control` breakpoints are emitted for `glm-5p2` — caching, if any, is the provider's
+  implicit prefix caching.
+- `createClient()` (`:488-499`) still forwards `sessionId` as `x-session-affinity` /
+  `x-client-request-id` headers when `sendSessionAffinityHeaders` is set — routing, not cache identity.
+  Same conclusion as the Anthropic path.
+
+Either way, `cacheRetention: "none"` is the correct setting: on `kimi-k3` it avoids a write premium for
+reads that cannot happen, and on `glm-5p2` it suppresses a `prompt_cache_key` that would only pin
+routing for a prompt nobody will send again. Note both models price `cacheWrite: 0` — so on Fireworks
+specifically the wasted-write cost is zero and the fix is about correctness and consistency with pi's
+convention rather than about a billing saving on this particular shortlist.

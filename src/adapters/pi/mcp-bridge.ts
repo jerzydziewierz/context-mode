@@ -21,7 +21,9 @@
  * No external dependencies — pure node:child_process + JSON line frames.
  */
 
-import { existsSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { spawn, execSync, type ChildProcess } from "node:child_process";
 import { detectRuntimes } from "../../runtime.js";
@@ -122,6 +124,306 @@ export interface MCPTool {
 export interface MCPCallResult {
   content?: Array<{ type?: string; text?: string }>;
   isError?: boolean;
+  _meta?: Record<string, unknown>;
+}
+
+const QUESTION_META_KEY = "context-mode/question";
+/**
+ * `details` key carrying the real MCP error state of a question-mode result.
+ *
+ * Question mode cannot signal failure by throwing (the throw contract used by
+ * the non-question path below) because a failed command STILL needs its
+ * compact answer delivered to the primary agent. So the bridge returns a
+ * normal result and smuggles the error state through `details`; the extension's
+ * `tool_result` handler re-raises it as `isError`. Namespaced to match the
+ * `_meta` convention (`QUESTION_META_KEY`) because `details` is persisted on
+ * the `toolResult` message and is therefore an on-disk public surface.
+ */
+export const QUESTION_IS_ERROR_DETAILS_KEY = "context-mode/questionIsError";
+const QUESTION_MODEL_SHORTLIST_PATH = join(homedir(), ".pi", "model-shortlist.env");
+
+interface QuestionMeta {
+  version: number;
+  question: string;
+  answerInput: string;
+  evidence: string;
+  rawOutputBytes: number;
+  outputReduced: boolean;
+  source: string;
+  status: string;
+  exitCode: number;
+  timedOut: boolean;
+  backgrounded: boolean;
+  isError: boolean;
+}
+
+interface PiQuestionContext {
+  model?: any;
+  scopedModels?: ReadonlyArray<{ model: any; thinkingLevel?: string }>;
+  thinkingLevel?: string;
+  signal?: AbortSignal;
+  sessionManager?: { getSessionId?: () => string };
+  modelRegistry?: {
+    getAvailable?: () => any[];
+    getApiKeyAndHeaders?: (model: any) => Promise<{
+      ok: boolean;
+      apiKey?: string;
+      headers?: Record<string, string>;
+      env?: Record<string, string>;
+      error?: string;
+    }>;
+    getProvider?: (provider: string) => {
+      streamSimple: (model: any, context: unknown, options?: Record<string, unknown>) => {
+        result: () => Promise<any>;
+      };
+    } | undefined;
+  };
+}
+
+function getQuestionMeta(result: MCPCallResult): QuestionMeta | null {
+  const value = result._meta?.[QUESTION_META_KEY];
+  if (!value || typeof value !== "object") return null;
+  const meta = value as Partial<QuestionMeta>;
+  if (
+    meta.version !== 1
+    || typeof meta.question !== "string"
+    || typeof meta.answerInput !== "string"
+    || typeof meta.evidence !== "string"
+    || typeof meta.rawOutputBytes !== "number"
+    || typeof meta.outputReduced !== "boolean"
+    || typeof meta.source !== "string"
+    || typeof meta.status !== "string"
+  ) return null;
+  return meta as QuestionMeta;
+}
+
+function modelRef(model: any): string {
+  return `${String(model?.provider ?? "")}/${String(model?.id ?? "")}`;
+}
+
+export function readQuestionModelShortlist(
+  path: string = QUESTION_MODEL_SHORTLIST_PATH,
+): string[] {
+  if (!existsSync(path)) return [];
+  const refs: string[] = [];
+  try {
+    for (const rawLine of readFileSync(path, "utf-8").split("\n")) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith("#")) continue;
+      const match = line.match(/^\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*(.+)$/);
+      const ref = (match?.[1] ?? line).trim();
+      if (ref && !refs.includes(ref)) refs.push(ref);
+    }
+  } catch {
+    return [];
+  }
+  return refs;
+}
+
+function findShortlistModel(ref: string, models: any[]): any | undefined {
+  const normalized = ref.trim().toLowerCase();
+  const canonical = models.filter((model) => modelRef(model).toLowerCase() === normalized);
+  if (canonical.length === 1) return canonical[0];
+  const byId = models.filter((model) => String(model?.id ?? "").toLowerCase() === normalized);
+  return byId.length === 1 ? byId[0] : undefined;
+}
+
+export function selectQuestionModel(
+  ctx: PiQuestionContext,
+  shortlistRefs: readonly string[] = readQuestionModelShortlist(),
+): { model: any; thinkingLevel?: string } {
+  const scoped = Array.isArray(ctx.scopedModels) ? [...ctx.scopedModels] : [];
+  if (shortlistRefs.length > 0) {
+    const available = ctx.modelRegistry?.getAvailable?.() ?? scoped.map((entry) => entry.model);
+    for (const ref of shortlistRefs) {
+      const model = findShortlistModel(ref, available);
+      if (!model) continue;
+      const scopedMatch = scoped.find((entry) => modelRef(entry.model) === modelRef(model));
+      return { model, thinkingLevel: scopedMatch?.thinkingLevel };
+    }
+    throw new Error(`No available question model is listed in ${QUESTION_MODEL_SHORTLIST_PATH}`);
+  }
+
+  if (ctx.model) return { model: ctx.model, thinkingLevel: ctx.thinkingLevel };
+  if (scoped.length > 0) return scoped[0];
+  throw new Error("No Pi model is available for question answering");
+}
+
+function compactEvidence(rawOutput: string, preferred: string): string {
+  const candidates = preferred
+    .split(/\n{2,}|\n---\n/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+  for (const candidate of candidates) {
+    if (rawOutput.includes(candidate)) return candidate.slice(0, 800);
+  }
+  return rawOutput.trim().slice(0, 800) || "(no output)";
+}
+
+function buildQuestionInput(meta: QuestionMeta, model: any): string {
+  const advertisedWindow = Number(model?.contextWindow);
+  const contextWindow = Number.isFinite(advertisedWindow) && advertisedWindow > 0
+    ? advertisedWindow
+    : 32_000;
+  // One UTF-16 code unit per token is a conservative fallback for source,
+  // Unicode logs, and JSON. Reserve room for instructions and the answer.
+  const maxChars = Math.max(1_000, Math.min(250_000, contextWindow - 4_000));
+  let executionResult = meta.answerInput;
+  let truncated = meta.outputReduced;
+  if (executionResult.length > maxChars) {
+    truncated = true;
+    const head = meta.answerInput.slice(0, 1_000);
+    const tail = meta.answerInput.slice(-1_500);
+    const evidenceBudget = Math.max(1_000, maxChars - head.length - tail.length - 500);
+    executionResult = [
+      "Start of raw output:",
+      head,
+      "Question-matched evidence:",
+      meta.evidence.slice(0, evidenceBudget),
+      "End of raw output:",
+      tail,
+    ].join("\n\n");
+  }
+  return JSON.stringify({
+    question: meta.question,
+    authoritativeStatus: meta.status,
+    outputWasReduced: truncated,
+    executionResult,
+  });
+}
+
+function responseText(response: any): string {
+  if (!Array.isArray(response?.content)) return "";
+  return response.content
+    .filter((block: any) => block?.type === "text" && typeof block.text === "string")
+    .map((block: any) => block.text)
+    .join("\n")
+    .trim();
+}
+
+function parseQuestionAnswer(text: string, meta: QuestionMeta): { answer: string; evidence: string } | null {
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start >= 0 && end > start) {
+    try {
+      const parsed = JSON.parse(text.slice(start, end + 1)) as { answer?: unknown; evidence?: unknown };
+      if (typeof parsed.answer === "string" && parsed.answer.trim()) {
+        const proposed = Array.isArray(parsed.evidence)
+          ? parsed.evidence.filter((v): v is string => typeof v === "string").join("\n")
+          : typeof parsed.evidence === "string" ? parsed.evidence : "";
+        return {
+          answer: parsed.answer.trim(),
+          evidence: compactEvidence(meta.answerInput, proposed || meta.evidence),
+        };
+      }
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+export async function answerQuestionResult(
+  result: MCPCallResult,
+  ctx: PiQuestionContext | undefined,
+  shortlistRefs?: readonly string[],
+): Promise<{ text: string; usage?: unknown; originalIsError: boolean } | null> {
+  const meta = getQuestionMeta(result);
+  if (!meta) return null;
+  if (!ctx?.modelRegistry?.getApiKeyAndHeaders || !ctx.modelRegistry.getProvider) {
+    return {
+      text: (result.content ?? []).map((c) => c.text ?? "").join("\n"),
+      originalIsError: meta.isError,
+    };
+  }
+
+  try {
+    const selected = selectQuestionModel(ctx, shortlistRefs ?? readQuestionModelShortlist());
+    const auth = await ctx.modelRegistry.getApiKeyAndHeaders(selected.model);
+    if (!auth.ok) throw new Error(auth.error || "Question model authentication failed");
+    const provider = ctx.modelRegistry.getProvider(String(selected.model.provider));
+    if (!provider) throw new Error(`Question model provider not found: ${selected.model.provider}`);
+    const stream = provider.streamSimple(
+      selected.model,
+      {
+        systemPrompt: [
+          "Answer one question about a command result.",
+          "Use the authoritative status exactly as supplied.",
+          "Use only the execution result as evidence.",
+          "Return JSON with string fields answer and evidence.",
+          "Keep the answer compact.",
+          "Copy a short exact evidence excerpt from the execution result.",
+        ].join("\n"),
+        messages: [{
+          role: "user",
+          content: [{ type: "text", text: buildQuestionInput(meta, selected.model) }],
+          timestamp: Date.now(),
+        }],
+      },
+      {
+        apiKey: auth.apiKey,
+        headers: auth.headers,
+        env: auth.env,
+        signal: ctx.signal,
+        reasoning: selected.thinkingLevel ?? "low",
+        maxTokens: 1_200,
+        transport: "sse",
+        // Standalone request — never reuse, never write cache. The nested
+        // prompt (a one-off system prompt + a single synthetic user message)
+        // shares no leading bytes with the primary agent loop's prompt, and
+        // Anthropic/OpenAI prompt caching is prefix-byte matching. Any
+        // retention other than "none" therefore pays the cache-WRITE premium
+        // for reads that can never happen. Fresh sessionId for the same
+        // reason — a stable id would only pin routing affinity to a prompt
+        // nobody will send again. This mirrors pi core's own convention for
+        // one-off calls (compaction.js:444, examples/extensions/summarize.ts).
+        // Do not "optimize" this back to "short".
+        cacheRetention: "none",
+        sessionId: randomUUID(),
+      },
+    );
+    const response = await stream.result();
+    if (response?.stopReason === "error" || response?.stopReason === "aborted") {
+      throw new Error(response?.errorMessage || `Question model stopped: ${response?.stopReason}`);
+    }
+    const answered = parseQuestionAnswer(responseText(response), meta);
+    if (!answered) {
+      return {
+        text: [
+          `Status: ${meta.status}`,
+          "Answer: Semantic answer unavailable: the answer model returned invalid structured data.",
+          `Evidence: ${compactEvidence(meta.answerInput, meta.evidence)}`,
+          `Full output: ${meta.source}`,
+          `Retrieve: ctx_search(queries: [${JSON.stringify(meta.question)}], source: ${JSON.stringify(meta.source)})`,
+        ].join("\n"),
+        usage: response?.usage,
+        originalIsError: meta.isError,
+      };
+    }
+    return {
+      text: [
+        `Status: ${meta.status}`,
+        `Answer: ${answered.answer}`,
+        `Evidence: ${answered.evidence}`,
+        `Full output: ${meta.source}`,
+        `Retrieve: ctx_search(queries: [${JSON.stringify(meta.question)}], source: ${JSON.stringify(meta.source)})`,
+      ].join("\n"),
+      usage: response?.usage,
+      originalIsError: meta.isError,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      text: [
+        `Status: ${meta.status}`,
+        `Answer: Semantic answer unavailable: ${message}`,
+        `Evidence: ${compactEvidence(meta.answerInput, meta.evidence)}`,
+        `Full output: ${meta.source}`,
+        `Retrieve: ctx_search(queries: [${JSON.stringify(meta.question)}], source: ${JSON.stringify(meta.source)})`,
+      ].join("\n"),
+      originalIsError: meta.isError,
+    };
+  }
 }
 
 // Bridge-imposed timeout for protocol-handshake methods (initialize,
@@ -552,6 +854,7 @@ export class MCPStdioClient {
     method: string,
     params: unknown,
     timeoutMs: number = DEFAULT_REQUEST_TIMEOUT_MS,
+    signal?: AbortSignal,
   ): Promise<T> {
     // Respawn-on-idle-exit (#583, #583-followup).
     //
@@ -578,26 +881,42 @@ export class MCPStdioClient {
     if (!this.child) throw new Error("MCP client not started");
     const id = ++this.requestId;
     return new Promise<T>((resolve, reject) => {
+      if (signal?.aborted) {
+        reject(new Error("MCP request aborted"));
+        return;
+      }
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const onAbort = () => {
+        if (!this.pending.has(id)) return;
+        this.pending.delete(id);
+        if (timer) clearTimeout(timer);
+        this.notify("notifications/cancelled", { requestId: id, reason: "Pi tool call aborted" });
+        reject(new Error("MCP request aborted"));
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
       // Gate the timer on a finite ms value so callers can pass
       // `Number.POSITIVE_INFINITY` to mean "no bridge ceiling" (#643).
       // Node coerces both `undefined` and `Infinity` to a 1ms delay
       // (TimeoutOverflowWarning), so we can't just pass them through —
       // we must skip the setTimeout entirely. tools/call uses this path
       // because long-running ctx_execute must not be bounded here.
-      const timer = Number.isFinite(timeoutMs)
+      timer = Number.isFinite(timeoutMs)
         ? setTimeout(() => {
             if (!this.pending.has(id)) return;
             this.pending.delete(id);
+            signal?.removeEventListener("abort", onAbort);
             reject(new Error(`MCP request timeout after ${timeoutMs}ms: ${method}`));
           }, timeoutMs)
         : null;
       this.pending.set(id, {
         resolve: (v) => {
           if (timer) clearTimeout(timer);
+          signal?.removeEventListener("abort", onAbort);
           resolve(v as T);
         },
         reject: (e) => {
           if (timer) clearTimeout(timer);
+          signal?.removeEventListener("abort", onAbort);
           reject(e);
         },
       });
@@ -679,7 +998,7 @@ export class MCPStdioClient {
     return Array.isArray(result.tools) ? result.tools : [];
   }
 
-  async callTool(name: string, args: unknown): Promise<MCPCallResult> {
+  async callTool(name: string, args: unknown, signal?: AbortSignal): Promise<MCPCallResult> {
     // Respawn-on-idle-exit is now handled centrally in `request()`
     // (#583 follow-up). Originally patched here in #583 — moving it up
     // one layer covers `listTools` / `initialize` paths too, with a
@@ -697,6 +1016,7 @@ export class MCPStdioClient {
       "tools/call",
       { name, arguments: args ?? {} },
       Number.POSITIVE_INFINITY,
+      signal,
     );
   }
 
@@ -784,9 +1104,13 @@ export interface PiToolRegistration {
   execute: (
     toolCallId: string,
     params: Record<string, unknown>,
+    signal?: AbortSignal,
+    onUpdate?: unknown,
+    ctx?: PiQuestionContext,
   ) => Promise<{
     content: Array<{ type: "text"; text: string }>;
     details: Record<string, unknown>;
+    usage?: unknown;
     isError?: boolean;
   }>;
 }
@@ -1031,8 +1355,17 @@ export async function bootstrapMCPTools(
       parameters: tool.inputSchema ?? { type: "object", properties: {} },
       renderCall: createContextModeCallRenderer(tool.name),
       renderResult: createContextModeResultRenderer(tool.name),
-      async execute(_toolCallId, params) {
-        const result = await client.callTool(tool.name, params ?? {});
+      async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+        const result = await client.callTool(tool.name, params ?? {}, signal);
+        const questionCtx = ctx ? { ...ctx, signal: signal ?? ctx.signal } : undefined;
+        const questionAnswer = await answerQuestionResult(result, questionCtx);
+        if (questionAnswer) {
+          return {
+            content: [{ type: "text", text: questionAnswer.text }],
+            details: { [QUESTION_IS_ERROR_DETAILS_KEY]: questionAnswer.originalIsError },
+            usage: questionAnswer.usage,
+          };
+        }
         const text = (result.content ?? [])
           .filter((c) => c?.type === "text" && typeof c.text === "string")
           .map((c) => c.text as string)

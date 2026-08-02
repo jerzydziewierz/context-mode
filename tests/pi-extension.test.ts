@@ -1378,6 +1378,92 @@ describe("Pi MCP bridge (#426)", () => {
       expect(result.content[0].text).toMatch(/pi-bridge-smoke/);
       expect(result.isError).toBeFalsy();
     }, 30_000);
+
+    // End-to-end: question mode + a command that exits non-zero.
+    //
+    // Question mode is the ONE path where the bridge cannot signal failure by
+    // throwing — a failed command still needs its compact answer delivered to
+    // the primary agent. So the bridge returns a normal result and carries the
+    // real error state in `details[QUESTION_IS_ERROR_DETAILS_KEY]`, which the
+    // extension's tool_result handler re-raises as `isError`. Nothing covered
+    // that round trip before: the sibling tests in
+    // tests/adapters/pi-mcp-bridge.test.ts exercise answerQuestionResult with
+    // a synthetic `_meta` envelope (nested-model failure), never a real
+    // ctx_execute exit-7 flowing through the real server and out through the
+    // extension handler. A regression that dropped the details key — or that
+    // reverted to throwing — would leave every other test green while the
+    // primary agent silently lost either the failure signal or the answer.
+    it("question mode + nonzero exit: compact answer survives AND isError is re-raised", async () => {
+      const registered: any[] = [];
+      const fakePi = { registerTool: (tool: any) => registered.push(tool) };
+
+      const { bootstrapMCPTools, QUESTION_IS_ERROR_DETAILS_KEY } =
+        await import("../src/adapters/pi/mcp-bridge.js");
+      bridge = await bootstrapMCPTools(fakePi, mcpEntry, { env: mcpEnv });
+
+      const executeTool = registered.find((t) => t.name === "ctx_execute");
+      expect(executeTool).toBeDefined();
+
+      const marker = `pi-question-exit7-${process.pid}`;
+      // No Pi model ctx is passed, so answerQuestionResult takes the
+      // "no nested model available" branch and returns the server's
+      // envelope verbatim. That is exactly the surface under test: the
+      // error flag must survive independently of whether a semantic
+      // answer was produced.
+      const result = await executeTool.execute("question-exit-7", {
+        language: "shell",
+        code: `echo "${marker}"; exit 7`,
+        question: "Did the command succeed?",
+      });
+
+      // 1. The command failed, but the result came back normally — the
+      //    bridge must NOT have thrown.
+      const text = (result.content ?? [])
+        .map((c: any) => c?.text ?? "")
+        .join("\n");
+      expect(text).toContain("Status: failed (exit 7)");
+      expect(text).toContain("Retrieve: ctx_search");
+
+      // 2. The real error state rides in details under the namespaced key.
+      expect(result.details?.[QUESTION_IS_ERROR_DETAILS_KEY]).toBe(true);
+
+      // 3. The extension's tool_result handler turns that back into isError,
+      //    so the primary agent sees the failure.
+      const handlerApi = createMockPiApi();
+      await registerPiExtension(handlerApi, { projectDir: tempDir });
+      // Establish a session so the handler runs its FULL body (capture +
+      // flag), not the `!_sessionId` early return. Without this the test
+      // would still pass with the post-capture return deleted — the early
+      // return alone would satisfy it.
+      await handlerApi._trigger(
+        "session_start",
+        {},
+        { session_id: "question-exit-7", project_dir: tempDir },
+      );
+      const raised = await handlerApi._trigger("tool_result", {
+        tool_name: "context_mode_ctx_execute",
+        params: { language: "shell", code: `exit 7` },
+        result: text,
+        details: result.details,
+      });
+      expect(raised).toMatchObject({ isError: true });
+
+      // Control: a successful question-mode call must NOT set the flag,
+      // otherwise the assertion above would pass for any result at all.
+      const okResult = await executeTool.execute("question-exit-0", {
+        language: "shell",
+        code: `echo "${marker}-ok"`,
+        question: "Did the command succeed?",
+      });
+      expect(okResult.details?.[QUESTION_IS_ERROR_DETAILS_KEY]).toBe(false);
+      const notRaised = await handlerApi._trigger("tool_result", {
+        tool_name: "context_mode_ctx_execute",
+        params: { language: "shell", code: `echo ok` },
+        result: (okResult.content ?? []).map((c: any) => c?.text ?? "").join("\n"),
+        details: okResult.details,
+      });
+      expect(notRaised).toBeUndefined();
+    }, 60_000);
   });
 
   // ── Wiring: before_agent_start must bootstrap MCP tools

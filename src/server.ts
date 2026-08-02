@@ -2,6 +2,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createRequire } from "node:module";
+import { randomUUID } from "node:crypto";
 import { existsSync, unlinkSync, readdirSync, readFileSync, writeFileSync, writeSync, renameSync, rmSync, mkdirSync, cpSync, statSync, symlinkSync, lstatSync, realpathSync } from "node:fs";
 import { spawnSync, type SpawnSyncOptions, type SpawnSyncReturns } from "node:child_process";
 import { join, dirname, resolve, sep, isAbsolute } from "node:path";
@@ -758,6 +759,7 @@ const sessionStats = {
 type ToolResult = {
   content: Array<{ type: "text"; text: string }>;
   isError?: boolean;
+  _meta?: Record<string, unknown>;
 };
 
 function storageErrorResult(err: unknown): ToolResult | null {
@@ -1678,6 +1680,7 @@ WHEN:
   - You would otherwise read raw output and then mentally compute — that compute belongs here, in code, where its inputs stay out of your conversation
   - You need to keep a long-running process alive (dev server, watcher, daemon) — pass \`background: true\` to detach on timeout instead of killing the process
   - The output may legitimately be large but you only want recall-by-topic later — pass an \`intent\` string; outputs over ~5KB are auto-indexed into the knowledge base and only the section titles + previews come back, retrievable via ctx_search
+  - You need a focused answer but the raw command result must stay out of the primary Pi agent context — pass \`question\`; Pi uses a separate model call and returns status, answer, evidence, and a retrieval reference
 
 WHEN NOT:
   - Single observational command whose entire short output you intend to consume verbatim (whoami, pwd, git status on a clean tree) — Bash is simpler
@@ -1685,7 +1688,7 @@ WHEN NOT:
   - You already know the output is one short fixed line and you want to read it as-is
 
 RETURNS:
-  Only what your code prints. Wrap risky calls in try/catch — uncaught errors go to stderr and may leak more than intended. When \`intent\` is set and output exceeds the auto-index threshold, the response carries searchable section titles + previews instead of the raw stdout; use ctx_search(queries: [...]) to drill into specific sections.
+  Only what your code prints. Wrap risky calls in try/catch — uncaught errors go to stderr and may leak more than intended. When \`intent\` is set and output exceeds the auto-index threshold, the response carries searchable section titles + previews instead of the raw stdout; use ctx_search(queries: [...]) to drill into specific sections. When \`question\` is set under Pi, the primary agent receives only status, answer, evidence, and a full-output reference.
 
 EXAMPLE: ctx_execute(language: "javascript", code: "const out = require('child_process').execSync('npm test', {encoding:'utf8', stdio:['ignore','pipe','pipe']}); console.log(out.split('\\\\n').filter(l => /(FAIL|✗|×|Error:|Tests +.*(failed|passed))/i.test(l)).slice(0, 60).join('\\\\n'))")
 EXAMPLE: ctx_execute(language: "javascript", code: "const out = require('child_process').execSync('gh issue list --json number,title --limit 100', {encoding:'utf8'}); const hooks = JSON.parse(out).filter(i => /hook|routing/i.test(i.title)); console.log(\`\${hooks.length} hook-related issues\`)")`,
@@ -1738,9 +1741,15 @@ EXAMPLE: ctx_execute(language: "javascript", code: "const out = require('child_p
           "Use ctx_search(queries: [...]) to retrieve specific sections. Example: 'failing tests', 'HTTP 500 errors'." +
           "\n\nTIP: Use specific technical terms, not just concepts. Check 'Searchable terms' in the response for available vocabulary.",
         ),
+      question: z
+        .string()
+        .optional()
+        .describe(
+          "Ask a focused question about the execution result. Context Mode stores the full raw output and returns a compact answer, status, evidence, and retrieval reference. Semantic answering requires the Pi adapter.",
+        ),
     }),
   },
-  async ({ language, code, timeout, background, cwd, intent }) => {
+  async ({ language, code, timeout, background, cwd, intent, question }) => {
     // Security: deny-only firewall
     if (language === "shell") {
       const denied = checkDenyPolicy(code, "execute");
@@ -1839,6 +1848,23 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
       if (fsMatch) {
         sessionStats.bytesSandboxed += parseInt(fsMatch[1]);
         result.stderr = result.stderr.replace(/\n?__CM_FS__:\d+\n?/g, "");
+      }
+
+      if (question && question.trim().length > 0) {
+        return trackResponse("ctx_execute", buildQuestionResult({
+          question,
+          stdout: result.stdout,
+          stderr: result.stderr,
+          exitCode: result.exitCode,
+          timedOut: result.timedOut,
+          backgrounded: result.backgrounded === true,
+          sourcePrefix: `execute:${language}`,
+          isError: result.timedOut
+            ? result.backgrounded !== true
+            : result.exitCode !== 0
+              ? classifyNonZeroExit({ language, exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr }).isError
+              : false,
+        }));
       }
 
       if (result.timedOut) {
@@ -1979,6 +2005,89 @@ function indexStdout(
 const INTENT_SEARCH_THRESHOLD = 5_000; // bytes — ~80-100 lines
 const LARGE_OUTPUT_THRESHOLD = 102_400; // 100KB — auto-index into FTS5, return pointer
 
+const QUESTION_META_KEY = "context-mode/question";
+const QUESTION_SIDE_CHANNEL_MAX_CHARS = 300_000;
+
+interface QuestionResultInput {
+  question: string;
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+  timedOut: boolean;
+  backgrounded: boolean;
+  sourcePrefix: string;
+  isError: boolean;
+}
+
+function buildQuestionResult(input: QuestionResultInput): ToolResult {
+  const source = `${input.sourcePrefix}:question:${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`;
+  const rawOutput = formatRawExecutionOutput(input.stdout, input.stderr);
+  const store = getStore();
+  trackIndexed(Buffer.byteLength(rawOutput));
+  const indexed = store.indexPlainText(rawOutput, source, undefined, currentAttribution());
+  const matches = store.searchWithFallback(input.question, 5, source);
+  const evidence = matches.length > 0
+    ? matches.map((match) => match.content).join("\n\n---\n\n")
+    : charSafePrefix(rawOutput, 4_000);
+  const evidencePreview = charSafePrefix(evidence.replace(/\s+/g, " ").trim(), 500) || "(no output)";
+  const outputReduced = rawOutput.length > QUESTION_SIDE_CHANNEL_MAX_CHARS;
+  const answerInput = outputReduced
+    ? [
+        "Start of raw output:",
+        rawOutput.slice(0, 4_000),
+        "Question-matched evidence:",
+        evidence.slice(0, QUESTION_SIDE_CHANNEL_MAX_CHARS - 12_000),
+        "End of raw output:",
+        rawOutput.slice(-4_000),
+      ].join("\n\n")
+    : rawOutput;
+  const status = input.timedOut
+    ? input.backgrounded
+      ? `backgrounded after timeout (exit ${input.exitCode})`
+      : `timed out (exit ${input.exitCode})`
+    : input.exitCode === 0
+      ? "completed (exit 0)"
+      : `failed (exit ${input.exitCode})`;
+
+  return {
+    content: [{
+      type: "text",
+      text: [
+        `Status: ${status}`,
+        "Answer: No semantic answer was generated because this MCP host does not provide the Pi question-answer adapter.",
+        `Evidence: ${evidencePreview}`,
+        `Full output: ${indexed.label}`,
+        `Retrieve: ctx_search(queries: [${JSON.stringify(input.question)}], source: ${JSON.stringify(indexed.label)})`,
+      ].join("\n"),
+    }],
+    isError: input.isError,
+    _meta: {
+      [QUESTION_META_KEY]: {
+        version: 1,
+        question: input.question.trim(),
+        answerInput,
+        evidence,
+        rawOutputBytes: Buffer.byteLength(rawOutput),
+        outputReduced,
+        source: indexed.label,
+        status,
+        exitCode: input.exitCode,
+        timedOut: input.timedOut,
+        backgrounded: input.backgrounded,
+        isError: input.isError,
+      },
+    },
+  };
+}
+
+function formatRawExecutionOutput(stdout: string, stderr: string): string {
+  const out = stdout || "";
+  const err = stderr || "";
+  if (err.trim().length === 0) return out || "(no output)";
+  if (out.trim().length === 0) return `stderr:\n${err}`;
+  return `stdout:\n${out}\n\nstderr:\n${err}`;
+}
+
 function intentSearch(
   stdout: string,
   intent: string,
@@ -2062,6 +2171,7 @@ WHEN:
   - The file is structured (CSV, JSON, log, code) and a code-level derivation is cheaper than reading verbatim
   - The file is large enough that reading the full content would burn meaningful conversation memory you need for the actual work
   - The derivation may itself produce a large output you want recall-by-topic on later — pass an \`intent\` string; outputs over ~5KB are auto-indexed and only matching sections come back, retrievable via ctx_search
+  - You need a focused answer but the raw result must stay out of the primary Pi agent context — pass \`question\`; Pi returns status, answer, evidence, and a retrieval reference
 
 WHEN NOT:
   - You intend to EDIT the file — use Read so the subsequent Edit can match the exact text
@@ -2069,7 +2179,7 @@ WHEN NOT:
   - The file is small AND you will consume all of it for understanding/editing — Read directly
 
 RETURNS:
-  Only what your code prints. The FILE_CONTENT variable holds the raw bytes inside the sandbox; nothing else leaves. When \`intent\` is set and output exceeds the auto-index threshold, the response carries searchable section titles + previews instead of the raw stdout.
+  Only what your code prints. The FILE_CONTENT variable holds the raw bytes inside the sandbox; nothing else leaves. When \`intent\` is set and output exceeds the auto-index threshold, the response carries searchable section titles + previews instead of the raw stdout. When \`question\` is set under Pi, the primary agent receives only status, answer, evidence, and a full-output reference.
 
 EXAMPLE: ctx_execute_file(path: "huge.log", language: "javascript", code: "const errs = FILE_CONTENT.split('\\\\n').filter(l => /ERROR|FATAL/.test(l)); console.log(\`\${errs.length} error lines\`); console.log(errs.slice(-5).join('\\\\n'))")
 EXAMPLE: ctx_execute_file(path: "data.csv", language: "javascript", code: "const rows = FILE_CONTENT.split('\\\\n'); console.log(\`rows: \${rows.length - 1}, header: \${rows[0]}\`)")`,
@@ -2109,9 +2219,15 @@ EXAMPLE: ctx_execute_file(path: "data.csv", language: "javascript", code: "const
           "What you're looking for in the output. When provided and output is large (>5KB), " +
           "returns only matching sections via BM25 search instead of truncated output.",
         ),
+      question: z
+        .string()
+        .optional()
+        .describe(
+          "Ask a focused question about the execution result. Context Mode stores the full raw output and returns a compact answer, status, evidence, and retrieval reference. Semantic answering requires the Pi adapter.",
+        ),
     }),
   },
-  async ({ path, language, code, timeout, intent }) => {
+  async ({ path, language, code, timeout, intent, question }) => {
     // Security (#852): confine the processed file to the project root so
     // ctx_execute_file cannot be used to escape the host's sandbox/permission
     // controls. Runs before the deny-glob check — boundary first, then policy.
@@ -2143,6 +2259,23 @@ EXAMPLE: ctx_execute_file(path: "data.csv", language: "javascript", code: "const
       // Echo path + executed source code before stdout for audit/debug
       // (Issues #717 + #736).
       const echo = buildExecuteEcho(language, code, path);
+
+      if (question && question.trim().length > 0) {
+        return trackResponse("ctx_execute_file", buildQuestionResult({
+          question,
+          stdout: result.stdout,
+          stderr: result.stderr,
+          exitCode: result.exitCode,
+          timedOut: result.timedOut,
+          backgrounded: false,
+          sourcePrefix: `file:${path}`,
+          isError: result.timedOut
+            ? true
+            : result.exitCode !== 0
+              ? classifyNonZeroExit({ language, exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr }).isError
+              : false,
+        }));
+      }
 
       if (result.timedOut) {
         return trackResponse("ctx_execute_file", {

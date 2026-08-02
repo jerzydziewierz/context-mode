@@ -22,7 +22,7 @@ import { extractEvents, extractUserEvents, parsePiUsage, buildAgentUsageEvent } 
 import type { HookInput } from "../../session/extract.js";
 import { buildResumeSnapshot } from "../../session/snapshot.js";
 import type { SessionEvent } from "../../types.js";
-import { bootstrapMCPTools, makeBridgeDiag, isForegroundSession, type BridgeHandle } from "./mcp-bridge.js";
+import { bootstrapMCPTools, makeBridgeDiag, isForegroundSession, QUESTION_IS_ERROR_DETAILS_KEY, type BridgeHandle } from "./mcp-bridge.js";
 import { PiAdapter } from "./index.js";
 
 // ── Pi Tool Name Mapping ─────────────────────────────────
@@ -527,11 +527,25 @@ export default function piExtension(pi: any): void {
     }
   });
 
-  // ── 3. tool_result — PostToolUse event capture ─────────
-
+  // ── 3. tool_result — question-mode error flag + PostToolUse capture ─────
+  //
+  // ONE handler, deliberately. Pi chains `tool_result` handlers like
+  // middleware in registration order (docs/extensions.md), so two separate
+  // `pi.on("tool_result", …)` calls would make the "error flag restored
+  // before telemetry inspects the result" ordering incidental — a future edit
+  // that swaps the two registrations would change behavior with no test
+  // failure. Merging makes the order structural instead.
+  //
+  // The error-flag half: question mode cannot signal failure by throwing (a
+  // failed command still needs its compact answer delivered), so the bridge
+  // returns a normal result carrying the real MCP error state under
+  // QUESTION_IS_ERROR_DETAILS_KEY. Re-raise it as `isError` here.
   pi.on("tool_result", (event: any) => {
+    const questionIsError =
+      event?.details?.[QUESTION_IS_ERROR_DETAILS_KEY] === true;
+
     try {
-      if (!_sessionId) return;
+      if (!_sessionId) return questionIsError ? { isError: true } : undefined;
 
       const rawToolName = String(event?.toolName ?? event?.tool_name ?? "");
       let mappedToolName =
@@ -600,6 +614,10 @@ export default function piExtension(pi: any): void {
     } catch {
       // Silent — session capture must never break the tool call
     }
+
+    // Outside the try/catch: a capture failure must never swallow the error
+    // flag the primary agent depends on.
+    return questionIsError ? { isError: true } : undefined;
   });
 
   // ── 4. before_agent_start — Routing + active_memory + resume injection ─

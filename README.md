@@ -1041,6 +1041,30 @@ Full configs: [`configs/kiro/mcp.json`](configs/kiro/mcp.json) | [`configs/kiro/
 
 **Routing:** Automatic. The extension registers all key lifecycle events (`tool_call`, `tool_result`, `session_start`, `session_before_compact`), providing full session continuity and routing enforcement.
 
+**Question mode:** Pi can answer a focused question without putting the full command output in the primary agent context. Add `question` to `ctx_execute` or `ctx_execute_file`:
+
+```text
+ctx_execute({
+  language: "shell",
+  code: "npm test",
+  question: "Did the tests pass? Name each failure and its likely cause."
+})
+```
+
+Context Mode stores the full raw output in its content index. It sends the raw output to a separate Pi model call. The primary agent receives only the command status, answer, evidence excerpt, and retrieval reference. If the output exceeds the answer model's input budget, Context Mode sends the start, question-matched evidence, and end of the output instead.
+
+Pi reads the answer-model preference from `~/.pi/model-shortlist.env`. It uses the first available model in file order. Put a cheaper model first:
+
+```text
+# One model reference per line.
+accounts/fireworks/models/kimi-k3
+fireworks/accounts/fireworks/models/glm-5p2
+```
+
+Blank lines and lines that start with `#` are ignored. A reference can be a bare model ID or `provider/model-id`. `KEY=value` lines are also accepted; Context Mode reads the value. If the file is absent or empty, Pi uses the current model. If the file contains entries but none are available, the tool returns status, local evidence, and a configuration error.
+
+The answer model receives command output that can contain source code, logs, or secrets. Putting a model from another provider first sends that data to the other provider. Select a model inside the required data boundary.
+
 </details>
 
 <details>

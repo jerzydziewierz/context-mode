@@ -1,7 +1,21 @@
 # Bug report: two `tool_result` handlers registered in the Pi extension, error flag round-trips through `details`
 
-Status: **suspicious, unverified**. Found by reading the uncommitted diff. Tests pass, so this may be
-fine — but the mechanism is fragile enough to write down.
+Status: **FIXED (s3-cmq)**. All three suggested actions applied:
+
+- The two `tool_result` handlers are merged into one in `src/adapters/pi/extension.ts`, so the ordering
+  is structural rather than incidental. The error flag is returned *outside* the capture `try/catch`, so
+  a telemetry failure cannot swallow it.
+- The details key is namespaced: `contextModeQuestionIsError` → `"context-mode/questionIsError"`,
+  exported from the bridge as `QUESTION_IS_ERROR_DETAILS_KEY` so producer and consumer cannot drift.
+- The missing end-to-end test exists: `tests/pi-extension.test.ts`, "question mode + nonzero exit:
+  compact answer survives AND isError is re-raised" — real `ctx_execute` with `exit 7` through the real
+  MCP server, asserting both `Status: failed (exit 7)` in the text and `isError` out of the extension
+  handler, plus an exit-0 control. Verified non-vacuous against two mutations (deleting the handler's
+  return; blanking the bridge's `details`) — both turn it red. Point 4's open question is answered by
+  construction: the answer text and the error flag now demonstrably coexist.
+
+Original status: **suspicious, unverified**. Found by reading the uncommitted diff. Tests passed, so it
+may have been fine — but the mechanism was fragile enough to write down.
 
 ## Where
 

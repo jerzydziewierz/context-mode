@@ -6716,3 +6716,51 @@ describe("ctx_* MCP tool annotations (#846)", () => {
     }
   });
 });
+
+
+describe("ctx_execute question side channel", () => {
+  test("indexes full output and returns raw bytes only in MCP metadata", async () => {
+    const execute = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_execute");
+    expect(execute).toBeDefined();
+    const lines = Array.from({ length: 120 }, (_, i) =>
+      i === 73 ? "QUESTION_NEEDLE: two validation tests failed" : `raw-line-${i}`,
+    ).join("\\n");
+
+    const result = await execute!.handler({
+      language: "javascript",
+      code: `process.stdout.write(${JSON.stringify(lines)})`,
+      question: "How many validation tests failed? QUESTION_NEEDLE",
+    }) as {
+      content: Array<{ type: string; text: string }>;
+      isError?: boolean;
+      _meta?: Record<string, unknown>;
+    };
+
+    const meta = result._meta?.["context-mode/question"] as Record<string, unknown>;
+    expect(meta).toBeDefined();
+    expect(meta.status).toBe("completed (exit 0)");
+    expect(meta.answerInput).toBe(lines);
+    expect(meta.outputReduced).toBe(false);
+    expect(meta.rawOutputBytes).toBe(Buffer.byteLength(lines));
+    expect(String(meta.source)).toMatch(/^execute:javascript:question:/);
+    expect(result.content[0]?.text).toContain("Status: completed (exit 0)");
+    expect(result.content[0]?.text).toContain(`Full output: ${meta.source}`);
+    expect(result.content[0]?.text).toContain("QUESTION_NEEDLE");
+    expect(result.content[0]?.text).not.toContain("raw-line-119");
+  });
+
+  test("preserves nonzero exit status and error classification", async () => {
+    const execute = REGISTERED_CTX_TOOLS.find((tool) => tool.name === "ctx_execute");
+    const result = await execute!.handler({
+      language: "shell",
+      code: "echo 'ValidationError: missing apiKey' >&2; exit 7",
+      question: "Why did validation fail?",
+    }) as { isError?: boolean; _meta?: Record<string, unknown> };
+    const meta = result._meta?.["context-mode/question"] as Record<string, unknown>;
+
+    expect(result.isError).toBe(true);
+    expect(meta.status).toBe("failed (exit 7)");
+    expect(meta.exitCode).toBe(7);
+    expect(meta.answerInput).toContain("ValidationError: missing apiKey");
+  });
+});

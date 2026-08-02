@@ -88,6 +88,140 @@ describe("resolveJsRuntimeForBridge — Pi fork-bomb guard (#516)", () => {
   });
 });
 
+describe("Pi question-answer side channel", () => {
+  const questionResult = (isError = false) => ({
+    content: [{ type: "text", text: "fallback envelope" }],
+    isError,
+    _meta: {
+      "context-mode/question": {
+        version: 1,
+        question: "Did tests pass?",
+        answerInput: "Tests: 12 passed, 2 failed\nValidationError: missing apiKey",
+        evidence: "ValidationError: missing apiKey",
+        rawOutputBytes: 58,
+        outputReduced: false,
+        source: "execute:shell:question:test-id",
+        status: isError ? "failed (exit 1)" : "completed (exit 0)",
+        exitCode: isError ? 1 : 0,
+        timedOut: false,
+        backgrounded: false,
+        isError,
+      },
+    },
+  });
+
+  it("uses the configured scoped model and returns only the compact answer to the primary agent", async () => {
+    const { answerQuestionResult } = await import("../../src/adapters/pi/mcp-bridge.js");
+    const expensive = { provider: "p", id: "large", contextWindow: 100_000, cost: { input: 5, output: 10 } };
+    const cheap = { provider: "p", id: "small", contextWindow: 32_000, cost: { input: 0.1, output: 0.2 } };
+    const streamSimple = vi.fn(() => ({
+      result: async () => ({
+        content: [{ type: "text", text: '{"answer":"No. Two tests failed because apiKey is missing.","evidence":"ValidationError: missing apiKey"}' }],
+        stopReason: "stop",
+        usage: { input: 20, output: 10, cacheRead: 0, cacheWrite: 0, totalTokens: 30 },
+      }),
+    }));
+    const ctx = {
+      model: expensive,
+      scopedModels: [{ model: expensive }, { model: cheap, thinkingLevel: "minimal" }],
+      sessionManager: { getSessionId: () => "session-1" },
+      modelRegistry: {
+        getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "secret" }),
+        getProvider: () => ({ streamSimple }),
+      },
+    };
+
+    const answered = await answerQuestionResult(questionResult(true), ctx, ["p/small"]);
+
+    expect(streamSimple).toHaveBeenCalledTimes(1);
+    expect(streamSimple.mock.calls[0]?.[0]).toBe(cheap);
+    expect(streamSimple.mock.calls[0]?.[2]).toMatchObject({ reasoning: "minimal" });
+    expect(answered?.text).toContain("Status: failed (exit 1)");
+    expect(answered?.text).toContain("Answer: No. Two tests failed");
+    expect(answered?.text).toContain("Evidence: ValidationError: missing apiKey");
+    expect(answered?.text).toContain("Full output: execute:shell:question:test-id");
+    expect(answered?.text).not.toContain("Tests: 12 passed, 2 failed");
+    expect(answered?.usage).toMatchObject({ totalTokens: 30 });
+    expect(answered?.originalIsError).toBe(true);
+  });
+
+  it("cancels an in-flight MCP tool request when Pi aborts the tool", async () => {
+    const { MCPStdioClient } = await import("../../src/adapters/pi/mcp-bridge.js");
+    const frames: string[] = [];
+    const client = new MCPStdioClient("/unused/server.mjs");
+    (client as unknown as { child: unknown }).child = {
+      stdin: {
+        destroyed: false,
+        writableEnded: false,
+        closed: false,
+        write: (data: string, cb?: (err?: Error) => void) => {
+          frames.push(data);
+          cb?.();
+          return true;
+        },
+      },
+    };
+    const controller = new AbortController();
+    const call = client.callTool("ctx_execute", {}, controller.signal);
+    controller.abort();
+
+    await expect(call).rejects.toThrow("MCP request aborted");
+    expect(frames.join("\n")).toContain("notifications/cancelled");
+    expect((client as unknown as { pending: Map<number, unknown> }).pending.size).toBe(0);
+  });
+
+  it("reads shortlist entries in file order and supports env-style lines", async () => {
+    const { readQuestionModelShortlist } = await import("../../src/adapters/pi/mcp-bridge.js");
+    const path = join(scratch, "model-shortlist.env");
+    writeFileSync(path, [
+      "# preferred answer models",
+      "accounts/fireworks/models/kimi-k3",
+      "QUESTION_MODEL=p/small",
+      "accounts/fireworks/models/kimi-k3",
+      "",
+    ].join("\n"));
+    expect(readQuestionModelShortlist(path)).toEqual([
+      "accounts/fireworks/models/kimi-k3",
+      "p/small",
+    ]);
+  });
+
+  it("uses the first available model in shortlist order, including bare ids with slashes", async () => {
+    const { selectQuestionModel } = await import("../../src/adapters/pi/mcp-bridge.js");
+    const first = { provider: "fireworks", id: "accounts/fireworks/models/kimi-k3" };
+    const second = { provider: "p", id: "small" };
+    const selected = selectQuestionModel({
+      model: second,
+      modelRegistry: { getAvailable: () => [second, first] },
+    }, ["accounts/fireworks/models/kimi-k3", "p/small"]);
+    expect(selected.model).toBe(first);
+  });
+
+  it("rejects a nonempty shortlist when none of its models are available", async () => {
+    const { selectQuestionModel } = await import("../../src/adapters/pi/mcp-bridge.js");
+    expect(() => selectQuestionModel({
+      model: { provider: "p", id: "current" },
+      modelRegistry: { getAvailable: () => [] },
+    }, ["p/not-available"])).toThrow("No available question model is listed");
+  });
+
+  it("falls back to a compact evidence envelope when the nested model fails", async () => {
+    const { answerQuestionResult } = await import("../../src/adapters/pi/mcp-bridge.js");
+    const model = { provider: "p", id: "small", contextWindow: 32_000, cost: { input: 1, output: 1 } };
+    const answered = await answerQuestionResult(questionResult(), {
+      model,
+      scopedModels: [{ model }],
+      modelRegistry: {
+        getApiKeyAndHeaders: async () => ({ ok: false, error: "no credentials" }),
+        getProvider: () => undefined,
+      },
+    }, ["p/small"]);
+    expect(answered?.text).toContain("Semantic answer unavailable: no credentials");
+    expect(answered?.text).toContain("Evidence: ValidationError: missing apiKey");
+    expect(answered?.text).not.toContain("Tests: 12 passed, 2 failed");
+  });
+});
+
 // Slice 2 — env depth counter
 describe("MCP bridge spawn — passes CONTEXT_MODE_BRIDGE_DEPTH=1 to child env (#516)", () => {
   it("child process inherits CONTEXT_MODE_BRIDGE_DEPTH=1", async () => {
