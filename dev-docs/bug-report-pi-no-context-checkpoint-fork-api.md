@@ -1,6 +1,8 @@
 # Bug report / capability gap: pi has no in-process "checkpoint + clone current context" API
 
-Status: **capability gap in pi core**, not a context-mode defect. Recorded here because it blocks the
+Status: **RESOLVED 2026-08-02 by experiment** — the capability is achievable as a pure extension
+via the before_provider_request wire-snapshot method (see
+dev-docs/cache-experiment/MANUAL.md; commit 19e51d0). No pi core API needed. Recorded here because it blocks the
 feature Grey asked for, and because a future agent will otherwise re-derive this from scratch.
 
 ## What Grey wants
