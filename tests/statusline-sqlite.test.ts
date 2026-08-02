@@ -136,22 +136,31 @@ function seedSessionDb(opts: {
      VALUES (?, ?, ?, ?, ?, ?, '')`
   );
   const seenSessions = new Set<string>();
-  for (const ev of opts.events) {
-    const sid = ev.sessionId ?? "default-session";
-    insert.run(
-      sid,
-      ev.type ?? "tool_use",
-      ev.category ?? "tool",
-      ev.data ?? "x".repeat(256),
-      ev.bytesAvoided ?? 0,
-      ev.bytesReturned ?? 0,
-    );
-    seenSessions.add(sid);
-  }
+  // Issue #statusline-sqlite-flake: better-sqlite3 autocommits each statement,
+  // so a bare for-loop over 3050 rows = 3050 transactions = 3050 fsyncs — the
+  // fixture alone takes ~50-70s on slow-fsync filesystems and times out the
+  // 30s test budget. Wrap the batch in one transaction so seeding is ~instant.
+  const seedEvents = db.transaction((events: typeof opts.events) => {
+    for (const ev of events) {
+      const sid = ev.sessionId ?? "default-session";
+      insert.run(
+        sid,
+        ev.type ?? "tool_use",
+        ev.category ?? "tool",
+        ev.data ?? "x".repeat(256),
+        ev.bytesAvoided ?? 0,
+        ev.bytesReturned ?? 0,
+      );
+      seenSessions.add(sid);
+    }
+  });
+  seedEvents(opts.events);
   const insertMeta = db.prepare(
     `INSERT OR IGNORE INTO session_meta (session_id, project_dir) VALUES (?, '/tmp/test')`
   );
-  for (const sid of seenSessions) insertMeta.run(sid);
+  db.transaction(() => {
+    for (const sid of seenSessions) insertMeta.run(sid);
+  })();
   if (opts.resume) {
     db.prepare(
       `INSERT INTO session_resume (session_id, snapshot, event_count) VALUES (?, ?, ?)`
