@@ -1,6 +1,53 @@
 # Bug report: Pi frozen-context question path has no checkpoint on live call
 
-Status: **OPEN — live repro 2026-08-06; diagnosis intentionally parked for next session.**
+Status: **DIAGNOSED 2026-08-06 — not a hook failure. The active provider was
+OpenAI Responses; capture and replay are Anthropic-only. Anthropic works.
+Remaining work is a scope decision (Q-s5-cmq-1), not a defect hunt.**
+
+## Diagnosis (2026-08-06, supersedes the hypotheses below)
+
+Live diagnostics under `openai-codex/gpt-5.6-sol` returned:
+
+```text
+activeModel=openai-codex/gpt-5.6-sol
+captureAttempts=17; captureAccepted=0; captureOutcome=no-messages
+payloadKeys=include,input,instructions,model,parallel_tool_calls,
+            prompt_cache_key,reasoning,store,stream,text,tool_choice,tools
+payloadModel=gpt-5.6-sol
+```
+
+`captureAttempts=17` settles it: **`before_provider_request` fires and reaches
+capture on every primary request.** Hypotheses 1-4 below are all ruled out. The
+payload carries `input`, not `messages` — an OpenAI Responses wire shape — so
+the Anthropic-specific guard at `frozen-context.ts:66-83` rejects it and leaves
+the slot null. `no-checkpoint` was correct behaviour on an unsupported provider,
+reported vaguely.
+
+On Anthropic the same code works. Live on `dario/claude-opus-5`, cold then warm:
+
+- `askWithFrozenContext()` (Exp D): `cacheWrite=14699` → `cacheRead=14675`.
+- `answerQuestionResult()` end to end (Exp E): `path=frozen-context;
+  frozenContext=replayed`, `cacheWrite=15041` → `cacheRead=14649`, with the
+  shortlist fallback wired to throw (so it provably never ran).
+
+See `dev-docs/cache-experiment/exp-d-shipped-replay.mjs` and
+`exp-e-bridge-endtoend.mjs`.
+
+**Still unproven:** capture fed by the real hook *on Anthropic*. D/E capture
+synthetically. One in-pi `ctx_execute(..., question, debug:true)` on a
+`dario/claude-*` model closes this; expect `captureOutcome=accepted` and
+`path=frozen-context`. Attempted at the end of s6 but the `ctx_*` MCP tools had
+stopped resolving in that session — likely needs a full pi restart to reload the
+rebuilt extension.
+
+**Follow-on defect (unfixed):** on a non-Anthropic provider the debug line says
+`frozenContext=no-checkpoint`, which reads like a capture bug. It should say
+`unsupported-payload` / name the provider shape. Cheap fix once Q-s5-cmq-1 is
+answered.
+
+---
+
+## Original report (2026-08-06, pre-diagnosis)
 
 ## Symptom
 

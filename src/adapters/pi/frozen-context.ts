@@ -58,18 +58,86 @@ export interface FrozenContextCheckpoint {
 
 let _checkpoint: FrozenContextCheckpoint | null = null;
 
+export type FrozenContextCaptureOutcome =
+  | "never-attempted"
+  | "accepted"
+  | "not-object"
+  | "no-model"
+  | "no-messages"
+  | "empty-messages"
+  | "capture-error"
+  | "cleared";
+
+/**
+ * Safe structural diagnostics for live capture failures. Values from the
+ * provider payload are deliberately excluded except for the wire model id;
+ * top-level key names are sanitized and bounded before storage.
+ */
+export interface FrozenContextCaptureDiagnostics {
+  attempts: number;
+  accepted: number;
+  clears: number;
+  lastOutcome: FrozenContextCaptureOutcome;
+  lastPayloadKeys: string[];
+  lastWireModelId?: string;
+  lastAttemptAt?: number;
+  lastAcceptedAt?: number;
+  lastClearedAt?: number;
+}
+
+let _captureDiagnostics: FrozenContextCaptureDiagnostics = {
+  attempts: 0,
+  accepted: 0,
+  clears: 0,
+  lastOutcome: "never-attempted",
+  lastPayloadKeys: [],
+};
+
+function safeDiagnosticAtom(value: string): string {
+  return value.replace(/[^a-zA-Z0-9._\/-]/g, "?").slice(0, 120);
+}
+
+function payloadKeyNames(payload: object): string[] {
+  return Object.keys(payload).sort().slice(0, 32).map(safeDiagnosticAtom);
+}
+
 /**
  * Rotating capture. Called from the extension's `before_provider_request`
  * handler for every primary request. Shape-guarded so summary/compaction
  * or malformed payloads never poison the slot. Never throws.
  */
 export function captureFrozenContext(payload: unknown): void {
+  const attemptedAt = Date.now();
+  _captureDiagnostics.attempts++;
+  _captureDiagnostics.lastAttemptAt = attemptedAt;
+  _captureDiagnostics.lastPayloadKeys = [];
+  _captureDiagnostics.lastWireModelId = undefined;
   try {
-    if (!payload || typeof payload !== "object") return;
+    if (!payload || typeof payload !== "object") {
+      _captureDiagnostics.lastOutcome = "not-object";
+      return;
+    }
+    _captureDiagnostics.lastPayloadKeys = payloadKeyNames(payload);
     const p = payload as FrozenPayload;
-    if (typeof p.model !== "string" || !Array.isArray(p.messages) || p.messages.length === 0) return;
-    _checkpoint = { payload: p, wireModelId: p.model, capturedAt: Date.now() };
+    if (typeof p.model !== "string") {
+      _captureDiagnostics.lastOutcome = "no-model";
+      return;
+    }
+    _captureDiagnostics.lastWireModelId = safeDiagnosticAtom(p.model);
+    if (!Array.isArray(p.messages)) {
+      _captureDiagnostics.lastOutcome = "no-messages";
+      return;
+    }
+    if (p.messages.length === 0) {
+      _captureDiagnostics.lastOutcome = "empty-messages";
+      return;
+    }
+    _checkpoint = { payload: p, wireModelId: p.model, capturedAt: attemptedAt };
+    _captureDiagnostics.accepted++;
+    _captureDiagnostics.lastAcceptedAt = attemptedAt;
+    _captureDiagnostics.lastOutcome = "accepted";
   } catch {
+    _captureDiagnostics.lastOutcome = "capture-error";
     // capture is best-effort telemetry-grade; never break the request path
   }
 }
@@ -78,9 +146,21 @@ export function getFrozenContextCheckpoint(): FrozenContextCheckpoint | null {
   return _checkpoint;
 }
 
+export function getFrozenContextCaptureDiagnostics(): FrozenContextCaptureDiagnostics {
+  return { ..._captureDiagnostics, lastPayloadKeys: [..._captureDiagnostics.lastPayloadKeys] };
+}
+
 /** Session boundary hygiene — a new session must never see the old prefix. */
 export function clearFrozenContextCheckpoint(): void {
   _checkpoint = null;
+  _captureDiagnostics = {
+    attempts: 0,
+    accepted: 0,
+    clears: _captureDiagnostics.clears + 1,
+    lastOutcome: "cleared",
+    lastPayloadKeys: [],
+    lastClearedAt: Date.now(),
+  };
 }
 
 function countCacheBreakpoints(payload: FrozenPayload): number {

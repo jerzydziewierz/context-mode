@@ -144,6 +144,8 @@ describe("Pi question-answer side channel", () => {
     expect(answered?.usage).toMatchObject({ totalTokens: 30 });
     expect(answered?.text).toContain("Debug: path=standalone; model=p/small; frozenContext=no-checkpoint");
     expect(answered?.text).toContain("cacheRead=0; cacheWrite=0; totalTokens=30");
+    expect(answered?.text).toContain("activeModel=p/large");
+    expect(answered?.text).toMatch(/captureAttempts=\d+; captureAccepted=\d+; captureOutcome=/);
     expect(answered?.originalIsError).toBe(true);
   });
 
@@ -283,15 +285,43 @@ describe("Pi question mode — frozen-context replay", () => {
     clearFrozenContextCheckpoint();
   });
 
-  it("captures only well-formed payloads and rotates to the latest", async () => {
-    const { captureFrozenContext, getFrozenContextCheckpoint, clearFrozenContextCheckpoint } =
-      await import("../../src/adapters/pi/frozen-context.js");
+  it("captures only well-formed payloads, records safe structural diagnostics, and rotates to the latest", async () => {
+    const {
+      captureFrozenContext,
+      getFrozenContextCaptureDiagnostics,
+      getFrozenContextCheckpoint,
+      clearFrozenContextCheckpoint,
+    } = await import("../../src/adapters/pi/frozen-context.js");
     clearFrozenContextCheckpoint();
 
     captureFrozenContext(undefined);
     captureFrozenContext("not an object");
     captureFrozenContext({ model: "m" }); // no messages
     captureFrozenContext({ messages: [{}] }); // no model
+    expect(getFrozenContextCheckpoint()).toBeNull();
+    expect(getFrozenContextCaptureDiagnostics()).toMatchObject({
+      attempts: 4,
+      accepted: 0,
+      lastOutcome: "no-model",
+      lastPayloadKeys: ["messages"],
+    });
+
+    // OpenAI Responses-shaped payload: record structure/model, never values.
+    const secret = "TOP-SECRET prompt and bearer token";
+    captureFrozenContext({
+      model: "gpt-5.6-sol\nspoofed-field=yes",
+      input: [{ role: "user", content: secret }],
+      authorization: secret,
+    });
+    const rejected = getFrozenContextCaptureDiagnostics();
+    expect(rejected).toMatchObject({
+      attempts: 5,
+      accepted: 0,
+      lastOutcome: "no-messages",
+      lastPayloadKeys: ["authorization", "input", "model"],
+      lastWireModelId: "gpt-5.6-sol?spoofed-field?yes",
+    });
+    expect(JSON.stringify(rejected)).not.toContain(secret);
     expect(getFrozenContextCheckpoint()).toBeNull();
 
     const first = primaryPayload();
@@ -302,9 +332,19 @@ describe("Pi question mode — frozen-context replay", () => {
     captureFrozenContext(second);
     expect(getFrozenContextCheckpoint()?.payload).toBe(second);
     expect(getFrozenContextCheckpoint()?.wireModelId).toBe("claude-opus-5");
+    expect(getFrozenContextCaptureDiagnostics()).toMatchObject({
+      attempts: 7,
+      accepted: 2,
+      lastOutcome: "accepted",
+    });
 
     clearFrozenContextCheckpoint();
     expect(getFrozenContextCheckpoint()).toBeNull();
+    expect(getFrozenContextCaptureDiagnostics()).toMatchObject({
+      attempts: 0,
+      accepted: 0,
+      lastOutcome: "cleared",
+    });
   });
 
   it("replays the FULL captured context plus one appended question block — not a question-only prompt", async () => {

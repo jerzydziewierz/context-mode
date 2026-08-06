@@ -1,6 +1,7 @@
 # Cache experiment — checkpoint + appended question → prompt-cache read (PROVEN)
 
-**Dates:** 2026-08-02 · **Status:** proven · **Decision impact: the checkpoint/clone
+**Dates:** 2026-08-02, extended 2026-08-06 · **Status:** proven, and proven again
+against the *shipped* code (Exp D/E) · **Decision impact: the checkpoint/clone
 question-mode feature is viable as a pure extension. No pi core changes needed.**
 
 ## Question
@@ -77,6 +78,38 @@ that injects the key. The rebuilt Context (`getSystemPrompt()` +
 `convertToLlm(buildSessionContext(entries, leafId))` + `getAllTools()`) is the
 "friendlier" path to verify next; C2 proves the byte-level mechanism regardless.
 
+### Exp D — the SHIPPED `askWithFrozenContext()` reads cache — ✅ PASS (2026-08-06)
+
+`exp-d-shipped-replay.mjs`. A/C2 proved the mechanism with bespoke scripts; D
+imports `build/adapters/pi/frozen-context.js` — the code we ship — captures a
+realistic Anthropic wire payload and replays it twice against the live dario
+proxy on `claude-opus-5`.
+
+Cold: `cacheWrite=14699` → `cacheRead=14675, cacheWrite=22`. Re-run inside the
+5-min TTL: `cacheRead=14699/14697, cacheWrite=0` on *both* calls.
+
+### Exp E — the SHIPPED question path, end to end — ✅ PASS (2026-08-06)
+
+`exp-e-bridge-endtoend.mjs`. Drives `answerQuestionResult()`, so it covers
+`buildFrozenQuestionInput` → replay → `parseQuestionAnswer` → debug line. The
+shortlist fallback's `streamSimple` is wired to **throw**, so a pass proves the
+fallback never ran.
+
+Both calls reported `path=frozen-context; frozenContext=replayed` with correct,
+context-aware answers. Cold: `cacheWrite=15041` → `cacheRead=14649`. Warm:
+`cacheRead=15036, cacheWrite=0`.
+
+→ **The Anthropic path is operationally proven, not just mock-proven.**
+
+**Scope limit — what D/E do NOT prove.** Both capture synthetically, so they
+prove *replay*. They do not prove pi's `before_provider_request` hook feeds
+capture in a live session. For that, run a real
+`ctx_execute(..., question, debug:true)` inside pi on a `dario/claude-*` model
+and read the `Debug:` line — expect `path=frozen-context` and `cacheRead > 0`.
+The live *negative* evidence so far (`captureOutcome=no-messages` under
+`openai-codex/gpt-5.6-sol`) shows the hook does fire and does reach capture;
+see `dev-docs/bug-report-pi-frozen-context-no-checkpoint.md`.
+
 ## Verdict → architecture for the base function
 
 | | |
@@ -100,6 +133,11 @@ size (~0.4-1MB per 100k-token context); (4) verify Fireworks/Nebius paths honor
 ## Artifacts
 
 - `exp-a-raw.mjs` — raw Anthropic mechanism test (Exp A).
+- `exp-d-shipped-replay.mjs` — shipped `askWithFrozenContext()` against the live
+  dario proxy (Exp D). `node dev-docs/cache-experiment/exp-d-shipped-replay.mjs`.
+- `exp-e-bridge-endtoend.mjs` — shipped `answerQuestionResult()` frozen path,
+  fallback wired to throw (Exp E). Same invocation. Both need `npm run build`
+  first and honour `CMQ_MODEL` (default `claude-opus-5`).
 - `cmq-exp-extension.ts` — the `pi -e` probe (Exp B/C): hook dump + turn_end
   snapshot/ask/diff + raw replay. Deterministic — needs no model cooperation.
 - `~/.pi/cmq-exp/payloads/*.json` — captured primary wire payloads.

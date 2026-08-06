@@ -28,7 +28,11 @@ import { join } from "node:path";
 import { spawn, execSync, type ChildProcess } from "node:child_process";
 import { detectRuntimes } from "../../runtime.js";
 import { foreignWorkspaceEnv, foreignIdentificationEnv } from "../detect.js";
-import { askWithFrozenContext, getFrozenContextCheckpoint } from "./frozen-context.js";
+import {
+  askWithFrozenContext,
+  getFrozenContextCaptureDiagnostics,
+  getFrozenContextCheckpoint,
+} from "./frozen-context.js";
 
 interface PendingRequest {
   resolve: (value: unknown) => void;
@@ -208,6 +212,7 @@ function questionDebugLine(
   model: any,
   usage?: unknown,
   frozenContext?: string,
+  primaryModel?: any,
 ): string[] {
   if (!enabled) return [];
   const fields = [`path=${path}`];
@@ -220,6 +225,19 @@ function questionDebugLine(
       if (typeof values[key] === "number") fields.push(`${key}=${values[key]}`);
     }
   }
+  const capture = getFrozenContextCaptureDiagnostics();
+  const activeRef = modelRef(primaryModel);
+  if (activeRef !== "/") fields.push(`activeModel=${activeRef}`);
+  fields.push(
+    `captureAttempts=${capture.attempts}`,
+    `captureAccepted=${capture.accepted}`,
+    `captureOutcome=${capture.lastOutcome}`,
+  );
+  if (capture.lastPayloadKeys.length > 0) fields.push(`payloadKeys=${capture.lastPayloadKeys.join(",")}`);
+  if (capture.lastWireModelId) fields.push(`payloadModel=${capture.lastWireModelId}`);
+  if (capture.lastAttemptAt) fields.push(`captureAttemptAt=${capture.lastAttemptAt}`);
+  if (capture.lastAcceptedAt) fields.push(`captureAcceptedAt=${capture.lastAcceptedAt}`);
+  if (capture.lastClearedAt) fields.push(`captureClearedAt=${capture.lastClearedAt}`);
   return [`Debug: ${fields.join("; ")}`];
 }
 
@@ -383,7 +401,7 @@ export async function answerQuestionResult(
     return {
       text: [
         text,
-        ...questionDebugLine(debug, "unavailable", ctx?.model, undefined, "pi-adapter-unavailable"),
+        ...questionDebugLine(debug, "unavailable", ctx?.model, undefined, "pi-adapter-unavailable", ctx?.model),
       ].filter(Boolean).join("\n"),
       originalIsError: meta.isError,
     };
@@ -438,7 +456,7 @@ export async function answerQuestionResult(
               `Evidence: ${answered.evidence}`,
               `Full output: ${meta.source}`,
               `Retrieve: ctx_search(queries: [${JSON.stringify(meta.question)}], source: ${JSON.stringify(meta.source)})`,
-              ...questionDebugLine(debug, "frozen-context", primaryModel, replay.usage, "replayed"),
+              ...questionDebugLine(debug, "frozen-context", primaryModel, replay.usage, "replayed", primaryModel),
             ].join("\n"),
             usage: replay.usage,
             originalIsError: meta.isError,
@@ -454,7 +472,7 @@ export async function answerQuestionResult(
             `Evidence: ${compactEvidence(meta.answerInput, meta.evidence)}`,
             `Full output: ${meta.source}`,
             `Retrieve: ctx_search(queries: [${JSON.stringify(meta.question)}], source: ${JSON.stringify(meta.source)})`,
-            ...questionDebugLine(debug, "frozen-context", primaryModel, replay.usage, "replayed-invalid-answer"),
+            ...questionDebugLine(debug, "frozen-context", primaryModel, replay.usage, "replayed-invalid-answer", primaryModel),
           ].join("\n"),
           usage: replay.usage,
           originalIsError: meta.isError,
@@ -527,7 +545,7 @@ export async function answerQuestionResult(
           `Evidence: ${compactEvidence(meta.answerInput, meta.evidence)}`,
           `Full output: ${meta.source}`,
           `Retrieve: ctx_search(queries: [${JSON.stringify(meta.question)}], source: ${JSON.stringify(meta.source)})`,
-          ...questionDebugLine(debug, "standalone", selected.model, response?.usage, frozenContextDebug),
+          ...questionDebugLine(debug, "standalone", selected.model, response?.usage, frozenContextDebug, primaryModel),
         ].join("\n"),
         usage: response?.usage,
         originalIsError: meta.isError,
@@ -540,7 +558,7 @@ export async function answerQuestionResult(
         `Evidence: ${answered.evidence}`,
         `Full output: ${meta.source}`,
         `Retrieve: ctx_search(queries: [${JSON.stringify(meta.question)}], source: ${JSON.stringify(meta.source)})`,
-        ...questionDebugLine(debug, "standalone", selected.model, response?.usage, frozenContextDebug),
+        ...questionDebugLine(debug, "standalone", selected.model, response?.usage, frozenContextDebug, primaryModel),
       ].join("\n"),
       usage: response?.usage,
       originalIsError: meta.isError,
@@ -554,7 +572,7 @@ export async function answerQuestionResult(
         `Evidence: ${compactEvidence(meta.answerInput, meta.evidence)}`,
         `Full output: ${meta.source}`,
         `Retrieve: ctx_search(queries: [${JSON.stringify(meta.question)}], source: ${JSON.stringify(meta.source)})`,
-        ...questionDebugLine(debug, "standalone", undefined, undefined, frozenContextDebug),
+        ...questionDebugLine(debug, "standalone", undefined, undefined, frozenContextDebug, primaryModel),
       ].join("\n"),
       originalIsError: meta.isError,
     };
