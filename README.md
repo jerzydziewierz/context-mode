@@ -1053,6 +1053,8 @@ ctx_execute({
 
 Context Mode stores the full raw output in its content index. It sends the raw output to a separate Pi model call. The primary agent receives only the command status, answer, evidence excerpt, and retrieval reference. If the output exceeds the answer model's input budget, Context Mode sends the start, question-matched evidence, and end of the output instead.
 
+Set `debug: true` (default: `false`) to append question-mode diagnostics to the result: the answer path (`frozen-context`, `standalone`, or `unavailable`), model, frozen-context fallback reason, and provider token usage including `cacheRead` and `cacheWrite`. This is the direct way to verify that a live call reused the frozen prompt cache.
+
 Pi reads the answer-model preference from `~/.pi/model-shortlist.env`. It uses the first available model in file order. Put a cheaper model first:
 
 ```text

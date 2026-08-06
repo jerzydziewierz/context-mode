@@ -1747,6 +1747,11 @@ EXAMPLE: ctx_execute(language: "javascript", code: "const out = require('child_p
         .describe(
           "Ask a focused question about the execution result. Context Mode stores the full raw output and returns a compact answer, status, evidence, and retrieval reference. Semantic answering requires the Pi adapter.",
         ),
+      debug: z
+        .preprocess(coerceBoolean, z.boolean())
+        .optional()
+        .default(false)
+        .describe("Show question-mode diagnostics, including the answer path, model, and prompt-cache usage. Default: false."),
     }),
   },
   async ({ language, code, timeout, background, cwd, intent, question }) => {
@@ -2225,6 +2230,11 @@ EXAMPLE: ctx_execute_file(path: "data.csv", language: "javascript", code: "const
         .describe(
           "Ask a focused question about the execution result. Context Mode stores the full raw output and returns a compact answer, status, evidence, and retrieval reference. Semantic answering requires the Pi adapter.",
         ),
+      debug: z
+        .preprocess(coerceBoolean, z.boolean())
+        .optional()
+        .default(false)
+        .describe("Show question-mode diagnostics, including the answer path, model, and prompt-cache usage. Default: false."),
     }),
   },
   async ({ path, language, code, timeout, intent, question }) => {

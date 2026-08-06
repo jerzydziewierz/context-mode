@@ -202,6 +202,27 @@ function modelRef(model: any): string {
   return `${String(model?.provider ?? "")}/${String(model?.id ?? "")}`;
 }
 
+function questionDebugLine(
+  enabled: boolean,
+  path: "frozen-context" | "standalone" | "unavailable",
+  model: any,
+  usage?: unknown,
+  frozenContext?: string,
+): string[] {
+  if (!enabled) return [];
+  const fields = [`path=${path}`];
+  const ref = modelRef(model);
+  if (ref !== "/") fields.push(`model=${ref}`);
+  if (frozenContext) fields.push(`frozenContext=${frozenContext}`);
+  if (usage && typeof usage === "object") {
+    const values = usage as Record<string, unknown>;
+    for (const key of ["input", "output", "cacheRead", "cacheWrite", "totalTokens"]) {
+      if (typeof values[key] === "number") fields.push(`${key}=${values[key]}`);
+    }
+  }
+  return [`Debug: ${fields.join("; ")}`];
+}
+
 export function readQuestionModelShortlist(
   path: string = QUESTION_MODEL_SHORTLIST_PATH,
 ): string[] {
@@ -353,12 +374,17 @@ export async function answerQuestionResult(
   result: MCPCallResult,
   ctx: PiQuestionContext | undefined,
   shortlistRefs?: readonly string[],
+  debug = false,
 ): Promise<{ text: string; usage?: unknown; originalIsError: boolean } | null> {
   const meta = getQuestionMeta(result);
   if (!meta) return null;
   if (!ctx?.modelRegistry?.getApiKeyAndHeaders || !ctx.modelRegistry.getProvider) {
+    const text = (result.content ?? []).map((c) => c.text ?? "").join("\n");
     return {
-      text: (result.content ?? []).map((c) => c.text ?? "").join("\n"),
+      text: [
+        text,
+        ...questionDebugLine(debug, "unavailable", ctx?.model, undefined, "pi-adapter-unavailable"),
+      ].filter(Boolean).join("\n"),
       originalIsError: meta.isError,
     };
   }
@@ -375,6 +401,15 @@ export async function answerQuestionResult(
   // MISS on this path is a cost issue, never a correctness issue.
   const checkpoint = getFrozenContextCheckpoint();
   const primaryModel = ctx.model;
+  let frozenContextDebug = !checkpoint
+    ? "no-checkpoint"
+    : !primaryModel
+      ? "no-primary-model"
+      : typeof (primaryModel as any).baseUrl !== "string"
+        ? "no-base-url"
+        : checkpoint.wireModelId !== String((primaryModel as any).id ?? "")
+          ? "model-mismatch"
+          : "eligible";
   if (
     checkpoint
     && primaryModel
@@ -403,6 +438,7 @@ export async function answerQuestionResult(
               `Evidence: ${answered.evidence}`,
               `Full output: ${meta.source}`,
               `Retrieve: ctx_search(queries: [${JSON.stringify(meta.question)}], source: ${JSON.stringify(meta.source)})`,
+              ...questionDebugLine(debug, "frozen-context", primaryModel, replay.usage, "replayed"),
             ].join("\n"),
             usage: replay.usage,
             originalIsError: meta.isError,
@@ -418,15 +454,18 @@ export async function answerQuestionResult(
             `Evidence: ${compactEvidence(meta.answerInput, meta.evidence)}`,
             `Full output: ${meta.source}`,
             `Retrieve: ctx_search(queries: [${JSON.stringify(meta.question)}], source: ${JSON.stringify(meta.source)})`,
+            ...questionDebugLine(debug, "frozen-context", primaryModel, replay.usage, "replayed-invalid-answer"),
           ].join("\n"),
           usage: replay.usage,
           originalIsError: meta.isError,
         };
       }
+      frozenContextDebug = "auth-unavailable";
     } catch {
       // Replay path failed (endpoint drift, auth, aborted, proxy down).
       // Fall through to the shortlist path — same behavior as before
       // this feature existed.
+      frozenContextDebug = "replay-failed";
     }
   }
 
@@ -488,6 +527,7 @@ export async function answerQuestionResult(
           `Evidence: ${compactEvidence(meta.answerInput, meta.evidence)}`,
           `Full output: ${meta.source}`,
           `Retrieve: ctx_search(queries: [${JSON.stringify(meta.question)}], source: ${JSON.stringify(meta.source)})`,
+          ...questionDebugLine(debug, "standalone", selected.model, response?.usage, frozenContextDebug),
         ].join("\n"),
         usage: response?.usage,
         originalIsError: meta.isError,
@@ -500,6 +540,7 @@ export async function answerQuestionResult(
         `Evidence: ${answered.evidence}`,
         `Full output: ${meta.source}`,
         `Retrieve: ctx_search(queries: [${JSON.stringify(meta.question)}], source: ${JSON.stringify(meta.source)})`,
+        ...questionDebugLine(debug, "standalone", selected.model, response?.usage, frozenContextDebug),
       ].join("\n"),
       usage: response?.usage,
       originalIsError: meta.isError,
@@ -513,6 +554,7 @@ export async function answerQuestionResult(
         `Evidence: ${compactEvidence(meta.answerInput, meta.evidence)}`,
         `Full output: ${meta.source}`,
         `Retrieve: ctx_search(queries: [${JSON.stringify(meta.question)}], source: ${JSON.stringify(meta.source)})`,
+        ...questionDebugLine(debug, "standalone", undefined, undefined, frozenContextDebug),
       ].join("\n"),
       originalIsError: meta.isError,
     };
@@ -1451,7 +1493,11 @@ export async function bootstrapMCPTools(
       async execute(_toolCallId, params, signal, _onUpdate, ctx) {
         const result = await client.callTool(tool.name, params ?? {}, signal);
         const questionCtx = ctx ? { ...ctx, signal: signal ?? ctx.signal } : undefined;
-        const questionAnswer = await answerQuestionResult(result, questionCtx);
+        const rawDebug = params && typeof params === "object"
+          ? (params as Record<string, unknown>).debug
+          : undefined;
+        const debug = rawDebug === true || (typeof rawDebug === "string" && rawDebug.toLowerCase() === "true");
+        const questionAnswer = await answerQuestionResult(result, questionCtx, undefined, debug);
         if (questionAnswer) {
           return {
             content: [{ type: "text", text: questionAnswer.text }],

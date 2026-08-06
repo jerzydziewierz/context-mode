@@ -131,7 +131,7 @@ describe("Pi question-answer side channel", () => {
       },
     };
 
-    const answered = await answerQuestionResult(questionResult(true), ctx, ["p/small"]);
+    const answered = await answerQuestionResult(questionResult(true), ctx, ["p/small"], true);
 
     expect(streamSimple).toHaveBeenCalledTimes(1);
     expect(streamSimple.mock.calls[0]?.[0]).toBe(cheap);
@@ -142,6 +142,8 @@ describe("Pi question-answer side channel", () => {
     expect(answered?.text).toContain("Full output: execute:shell:question:test-id");
     expect(answered?.text).not.toContain("Tests: 12 passed, 2 failed");
     expect(answered?.usage).toMatchObject({ totalTokens: 30 });
+    expect(answered?.text).toContain("Debug: path=standalone; model=p/small; frozenContext=no-checkpoint");
+    expect(answered?.text).toContain("cacheRead=0; cacheWrite=0; totalTokens=30");
     expect(answered?.originalIsError).toBe(true);
   });
 
@@ -219,6 +221,7 @@ describe("Pi question-answer side channel", () => {
     expect(answered?.text).toContain("Semantic answer unavailable: no credentials");
     expect(answered?.text).toContain("Evidence: ValidationError: missing apiKey");
     expect(answered?.text).not.toContain("Tests: 12 passed, 2 failed");
+    expect(answered?.text).not.toContain("Debug:");
   });
 });
 
@@ -321,7 +324,7 @@ describe("Pi question mode — frozen-context replay", () => {
           getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "dario" }),
           getProvider: () => ({ streamSimple }),
         },
-      }, ["p/small"]);
+      }, ["p/small"], true);
 
       expect(fetchSpy).toHaveBeenCalledTimes(1);
       expect(streamSimple).not.toHaveBeenCalled();
@@ -348,6 +351,8 @@ describe("Pi question mode — frozen-context replay", () => {
 
       // Answer + cache proof surface to the caller.
       expect(answered?.text).toContain("Answer: No. Two tests failed.");
+      expect(answered?.text).toContain("Debug: path=frozen-context; model=dario/claude-sonnet-5; frozenContext=replayed");
+      expect(answered?.text).toContain("cacheRead=15150; cacheWrite=0");
       expect(answered?.usage).toMatchObject({ cacheRead: 15_150, cacheWrite: 0 });
       expect(answered?.originalIsError).toBe(true);
     } finally {
@@ -399,12 +404,13 @@ describe("Pi question mode — frozen-context replay", () => {
           getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "secret" }),
           getProvider: () => ({ streamSimple }),
         },
-      }, []);
+      }, [], true);
       // Stale-prefix replay would be a guaranteed cache miss AND cross-model
       // context bleed — must fall through to the shortlist path instead.
       expect(fetchSpy).not.toHaveBeenCalled();
       expect(streamSimple).toHaveBeenCalledTimes(1);
       expect(answered?.text).toContain("Answer: ok");
+      expect(answered?.text).toContain("Debug: path=standalone; model=dario/claude-opus-5; frozenContext=model-mismatch");
     } finally {
       vi.unstubAllGlobals();
     }
@@ -435,11 +441,12 @@ describe("Pi question mode — frozen-context replay", () => {
           getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "k" }),
           getProvider: () => ({ streamSimple }),
         },
-      }, ["p/small"]);
+      }, ["p/small"], true);
       expect(fetchSpy).toHaveBeenCalledTimes(1);
       expect(streamSimple).toHaveBeenCalledTimes(1);
       expect(streamSimple.mock.calls[0]?.[0]).toBe(cheap);
       expect(answered?.text).toContain("Answer: fallback works");
+      expect(answered?.text).toContain("Debug: path=standalone; model=p/small; frozenContext=replay-failed");
     } finally {
       vi.unstubAllGlobals();
     }

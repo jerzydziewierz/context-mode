@@ -1378,6 +1378,14 @@ describe("Pi MCP bridge (#426)", () => {
         expect(reg.parameters).toBeTruthy();
         expect(typeof reg.execute).toBe("function");
       }
+
+      for (const name of ["ctx_execute", "ctx_execute_file"]) {
+        const reg = registered.find((tool) => tool.name === name);
+        expect(reg.parameters?.properties?.debug).toMatchObject({
+          type: "boolean",
+          default: false,
+        });
+      }
     }, 30_000);
 
     it("execute() round-trips through tools/call to the MCP server", async () => {
@@ -1442,6 +1450,7 @@ describe("Pi MCP bridge (#426)", () => {
         language: "shell",
         code: `echo "${marker}"; exit 7`,
         question: "Did the command succeed?",
+        debug: "true",
       });
 
       // 1. The command failed, but the result came back normally — the
@@ -1451,6 +1460,7 @@ describe("Pi MCP bridge (#426)", () => {
         .join("\n");
       expect(text).toContain("Status: failed (exit 7)");
       expect(text).toContain("Retrieve: ctx_search");
+      expect(text).toContain("Debug: path=unavailable; frozenContext=pi-adapter-unavailable");
 
       // 2. The real error state rides in details under the namespaced key.
       expect(result.details?.[QUESTION_IS_ERROR_DETAILS_KEY]).toBe(true);
